@@ -1,0 +1,30 @@
+name: taras_ami
+channels:
+  - defaults
+dependencies:
+  - accelerate
+  - datasets
+  - einops
+  - fastapi
+  - graphviz
+  - huggingface_hub
+  - ipython
+  - ipywidgets
+  - jupyter
+  - matplotlib
+  - networkx
+  - numpy
+  - pandas
+  - pip
+  - pytest
+  - python=3.10
+  - rich
+  - scipy
+  - seaborn
+  - tensorboard
+  - torchinfo
+  - tqdm
+  - transformers
+  - uvicorn
+  - wandb
+prefix: /home/taras/.conda/envs/taras_ami
