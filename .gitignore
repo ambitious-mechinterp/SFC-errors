@@ -1,5 +1,6 @@
 # Data
 /data/
+sfc-errors/data
 
 # Mac OS-specific storage files
 .DS_Store
