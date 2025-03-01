@@ -1,6 +1,13 @@
 # Data
 /data/
-sfc-errors/data
+# Ignore everything inside sfc-errors/data
+sfc-errors/data/*
+
+# But allow rc_train_filtered.json <- this is a light SFC dataset
+!sfc-errors/data/rc_train_filtered.json
+
+# Also, make sure the parent directory is not ignored
+!sfc-errors/data/
 
 # Mac OS-specific storage files
 .DS_Store
