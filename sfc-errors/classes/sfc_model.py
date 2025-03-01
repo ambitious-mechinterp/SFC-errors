@@ -2,11 +2,12 @@ from transformer_lens import ActivationCache
 from sae_lens import SAE, HookedSAETransformer
 import torch
 import numpy as np
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 import einops
 from jaxtyping import Float, Int
 from torch import Tensor
 from enum import Enum
+from functools import partial
 
 # utility to clear variables out of the memory & and clearing cuda cache
 import gc
@@ -114,8 +115,8 @@ class SFC_Gemma():
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
-    def compute_node_scores_for_normal_patching(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
-                                                score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING, run_without_saes=True):
+    def compute_sfc_scores_for_templatic_dataset(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
+                                                 score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING, run_without_saes=True):
         """
         Main interface method for computing AtP scores for given clean and patched datasets.
         The method can run the model in two modes: with and without SAEs.
@@ -179,6 +180,112 @@ class SFC_Gemma():
             clean_metric, patched_metric,
             node_scores
         )
+
+    def compute_act_patching_scores_for_errors(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None):
+        """
+        """
+        # Calculate how many total samples to process
+        n_prompts, seq_len = clean_dataset['prompt'].shape
+        assert n_prompts == clean_dataset['answer'].shape[0] == patched_dataset['answer'].shape[0]
+
+        prompts_to_process = n_prompts if total_batches is None else batch_size * total_batches
+
+        if total_batches is None:
+            total_batches = n_prompts // batch_size
+
+            if n_prompts % batch_size != 0:
+                total_batches += 1
+
+        # Utilities for getting hook names for activation errors and patching them
+        def get_error_activation_name(error_type, error_layer):
+            if error_type == 'resid':
+                hook_name = 'hook_resid_post'
+            elif error_type == 'mlp':
+                hook_name = 'hook_mlp_out'
+            elif error_type == 'attn':
+                hook_name = 'attn.hook_z'
+            else:
+                raise ValueError(f'Unknown error type: {error_type}')
+
+            return f'blocks.{error_layer}.{hook_name}.hook_sae_error'
+
+        def patched_to_clean_hook(act, hook, corrupted_cache):
+            try:
+                act[:] = corrupted_cache[hook.name][:]
+            except KeyError as e:
+                raise KeyError(f"Activation {hook.name} not found in corrupted cache.") from e
+            return act
+
+        # Initialize input and output data for patching
+        model = self.model
+        all_normalized_logit_dif = { # this will contain patching results
+            'resid': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device),                
+            'mlp': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device),
+            'attn': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device)}
+        layers_to_patch = {
+            'resid': list(range(self.n_layers)),
+            'mlp': list(range(self.n_layers)),
+            'attn': list(range(self.n_layers)),
+        }
+
+        # Loop over batches
+        for i in range(0, prompts_to_process, batch_size):
+            print(f'---\nSamples {i}/{prompts_to_process}\n---')
+            clean_prompts, corrupted_prompts, clean_answers, corrupted_answers, clean_answers_pos, corrupted_answers_pos, \
+                clean_attn_mask, corrupted_attn_mask = sample_dataset(i, i + batch_size, clean_dataset, patched_dataset)
+
+            # Get the corrupted cache (i.e. cache for patched prompts) for all the error nodes
+            corrupted_logits, corrupted_cache = model.run_with_cache(corrupted_prompts, attention_mask=corrupted_attn_mask, 
+                                                                     names_filter=lambda name: 'error' in name)
+            # Get the clean logits (output of the model on the clean prompts)
+            clean_logits = model(clean_prompts, attention_mask=clean_attn_mask)
+            
+            # Get the logit_diff - difference between incorrect and correct answers' logits - for clean and corrupted prompts
+            clean_logit_diff = self.get_logit_diff(clean_logits, clean_answers=clean_answers,
+                                            patched_answers=corrupted_answers,
+                                            answer_pos=clean_answers_pos)
+            corrupted_logit_diff = self.get_logit_diff(corrupted_logits, clean_answers=clean_answers,
+                                                patched_answers=corrupted_answers,
+                                                answer_pos=corrupted_answers_pos)            
+            # Computed the logit_dif baseline, that we'll use in the denominator later to compute the patching effects
+            normalized_logit_dif_denom = torch.where(corrupted_logit_diff - clean_logit_diff == 0, 
+                                                    torch.tensor(1, device=clean_logits.device), corrupted_logit_diff - clean_logit_diff)
+            # Define a hook to patch the corrupted activations (from the patched prompts) to the clean ones
+            # This matches the SFC metric
+            clean_cache_hook = partial(patched_to_clean_hook, corrupted_cache=corrupted_cache)
+
+            # Start patching for each error type (resid/mlp/attn) - outer loop
+            for error_type in layers_to_patch.keys():
+                print(f'Computing patching effect for {error_type} errors...')
+
+                # Apply patching to selected layers for the given error type
+                for layer in tqdm(layers_to_patch[error_type]):
+                    # run_with_hooks applies a given hook and detaches it afterwards
+                    logits = model.run_with_hooks(clean_prompts, attention_mask=clean_attn_mask, fwd_hooks=[
+                        (get_error_activation_name(error_type, layer), clean_cache_hook)
+                    ])
+                    
+                    # Compute the logit diff for our patching run
+                    logit_diff = self.get_logit_diff(logits, clean_answers=clean_answers,
+                                                     patched_answers=corrupted_answers,
+                                                     answer_pos=clean_answers_pos)
+                    
+                    # Compare the logit diff against the baseline by computing the normalized logit diff
+                    # If it's close to 1: the patching effect was successful - the model started to behave as if it was called on the patched prompts
+                    # If it's close to 0: the patching effect had little to no effect
+                    normalized_logit_dif = (logit_diff - clean_logit_diff) / normalized_logit_dif_denom
+
+                    all_normalized_logit_dif[error_type][layer] += normalized_logit_dif.mean(0)
+
+                    del logits, logit_diff, normalized_logit_dif
+                    clear_cache() 
+            del clean_cache_hook, corrupted_cache, clean_logits, corrupted_logits, clean_logit_diff, corrupted_logit_diff, normalized_logit_dif_denom
+            clear_cache()
+        
+        for error_type in all_normalized_logit_dif.keys():
+            all_normalized_logit_dif[error_type] /= total_batches
+
+        return all_normalized_logit_dif
 
     def run_with_cache(self, tokens: Int[Tensor, "batch pos"],
                        attn_mask: Int[Tensor, "batch pos"], metric,
