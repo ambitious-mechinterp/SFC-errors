@@ -287,6 +287,135 @@ class SFC_Gemma():
 
         return all_normalized_logit_dif
 
+    def compute_error_node_analysis(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None):
+        """
+        Computes the analysis of error nodes by returning:
+        1. Norm of error node activation difference (patched - clean)
+        2. Norm of gradient for each error node
+        3. Attribution patching score (dot product of the above)
+        
+        This allows for visualization to understand the relationship between activation
+        differences and gradients in error nodes.
+        
+        Returns:
+            dict: Dictionary with keys corresponding to error nodes and values being tuples of
+                (activation_diff_norm, gradient_norm, atp_score)
+        """
+        # Ensure SAEs are attached
+        if not self.are_saes_attached():
+            raise ValueError("This method requires SAEs to be attached. Call add_saes() first.")
+        
+        # Calculate how many total samples to process
+        n_prompts, seq_len = clean_dataset['prompt'].shape
+        assert n_prompts == clean_dataset['answer'].shape[0] == patched_dataset['answer'].shape[0]
+        
+        prompts_to_process = n_prompts if total_batches is None else batch_size * total_batches
+        
+        if total_batches is None:
+            total_batches = n_prompts // batch_size
+            if n_prompts % batch_size != 0:
+                total_batches += 1
+        
+        # Initialize data structures to store results
+        error_node_data = {}
+        
+        # We want only error node activations
+        error_node_fwd_filter = lambda name: 'hook_sae_error' in name
+        # We want only error node gradients, but we need to account for the fact that error nodes are just constants from the standpoint
+        # of PyTorch, so we choose to save only the gradients of hook_sae_output (which are precisely equal to the gradients 
+        # of hook_sae_error), but also specify hook_sae_input to implement pass-through gradient (check the _set_backward_hooks function)
+        error_node_bwd_filter = lambda name: 'hook_sae_output' in name or 'hook_sae_input' in name
+        
+        # Process each batch
+        for i in tqdm(range(0, prompts_to_process, batch_size)):
+            clean_prompts, corrupted_prompts, clean_answers, corrupted_answers, clean_answers_pos, corrupted_answers_pos, \
+            clean_attn_mask, corrupted_attn_mask = sample_dataset(i, i + batch_size, clean_dataset, patched_dataset)
+            
+            # Define metrics for clean and patched runs
+            metric_clean = lambda logits: self.get_logit_diff(logits, clean_answers, corrupted_answers, clean_answers_pos).mean()
+            
+            # Run clean model with cache to get gradients and activations
+            metric_clean_val, cache_clean, grad_clean = self.run_with_cache(
+                clean_prompts, 
+                clean_attn_mask, 
+                metric_clean,
+                fwd_cache_filter=error_node_fwd_filter,
+                bwd_cache_filter=error_node_bwd_filter,
+                run_backward_pass=True,
+                run_without_saes=False
+            )
+            
+            # Run patched model with cache to get activations (no gradients needed)
+            metric_patched_val, cache_patched, _ = self.run_with_cache(
+                corrupted_prompts,
+                corrupted_attn_mask,
+                lambda logits: self.get_logit_diff(logits, clean_answers, corrupted_answers, corrupted_answers_pos).mean(),
+                fwd_cache_filter=error_node_fwd_filter,
+                run_backward_pass=False,
+                run_without_saes=False
+            )
+            print('Metric clean:', metric_clean_val, ' Metric patched:', metric_patched_val)
+            
+            # Initialize data structure for this batch
+            batch_data = {}
+            
+            # Process each error node
+            for key in cache_clean.keys():
+                assert 'hook_sae_error' in key, f'Error node key {key} does not contain "hook_sae_error".'
+
+                # Get activation difference between patched and clean
+                activation_diff = cache_patched[key] - cache_clean[key]
+                
+                # Get gradient for this error node
+                gradient = grad_clean[key] # shape [batch pos d_act] OR [batch pos n_head d_head] for attn nodes
+                
+                # Reshape the attn hook_z activations & gradients to flatten the n_head dimension
+                if 'hook_z' in key:
+                    activation_diff = einops.rearrange(activation_diff, 
+                                                       'batch pos n_head d_head -> batch pos (n_head d_head)')
+                    gradient = einops.rearrange(gradient,
+                                                'batch pos n_head d_head -> batch pos (n_head d_head)')
+
+                # Compute our analysis metrics: norms of activation difference and gradient, and AtP score
+                activation_diff_norm = torch.norm(activation_diff, dim=-1)  # Norm across model dimension
+                gradient_norm = torch.norm(gradient, dim=-1)  # Norm across model dimension
+                atp_score = einops.einsum(gradient, activation_diff, 'batch pos d_act, batch pos d_act -> batch pos')
+                
+                # Store results for this error node in this batch
+                if key not in batch_data:
+                    batch_data[key] = []
+                
+                # Store as tuple (activation_diff_norm, gradient_norm, atp_score)
+                batch_data[key].append((activation_diff_norm, gradient_norm, atp_score))
+            
+            # Update main data structure with batch results
+            for key, batch_tuples in batch_data.items():
+                if key not in error_node_data:
+                    error_node_data[key] = []
+                error_node_data[key].extend(batch_tuples)
+            
+            # Clean up to prevent memory issues
+            del cache_clean, cache_patched, grad_clean, batch_data, activation_diff, gradient
+            clear_cache()
+        
+        # Aggregate results across batches
+        aggregated_data = {}
+        for key, tuples_list in error_node_data.items():
+            # Concatenate all batch data
+            activation_diff_norms = torch.cat([t[0] for t in tuples_list], dim=0)
+            gradient_norms = torch.cat([t[1] for t in tuples_list], dim=0)
+            atp_scores = torch.cat([t[2] for t in tuples_list], dim=0)
+            
+            # Average across batch dimension
+            activation_diff_norms_mean = activation_diff_norms.mean(dim=0)  # Shape: [pos]
+            gradient_norms_mean = gradient_norms.mean(dim=0)  # Shape: [pos]
+            atp_scores_mean = atp_scores.mean(dim=0)  # Shape: [pos]
+            
+            # Store aggregated results
+            aggregated_data[key] = (activation_diff_norms_mean, gradient_norms_mean, atp_scores_mean)
+        
+        return aggregated_data
+
     def run_with_cache(self, tokens: Int[Tensor, "batch pos"],
                        attn_mask: Int[Tensor, "batch pos"], metric,
                        fwd_cache_filter=None, bwd_cache_filter=None, run_backward_pass=True, run_without_saes=False):
@@ -375,8 +504,7 @@ class SFC_Gemma():
                     # We're copying the gradients from the SAE output activations to the SAE input activations gradients
                     sae_output_grad_name = hook.name.replace('hook_sae_input', 'hook_sae_output')
 
-                    grad_cache[hook.name] = temp_cache[sae_output_grad_name]
-                    gradient = grad_cache[hook.name]
+                    gradient = temp_cache[sae_output_grad_name] # this ensures that gradient propagation is unaffected by SAEs
 
                     # Pass-through: use the downstream gradients
                     return (gradient,)
