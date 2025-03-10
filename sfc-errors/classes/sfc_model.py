@@ -181,9 +181,39 @@ class SFC_Gemma():
             node_scores
         )
 
-    def compute_act_patching_scores_for_errors(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None):
+    def compute_act_patching_scores_for_errors(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
+                                               token_specific_error_types=None, token_positions=None, layers_to_patch=None):
         """
+        Compute activation patching scores for SAE error terms.
+        
+        Parameters:
+        -----------
+        clean_dataset: dict
+            Dictionary containing the clean prompts, answers, etc.
+        patched_dataset: dict
+            Dictionary containing the patched/corrupted prompts, answers, etc.
+        batch_size: int
+            Number of samples to process in each batch
+        total_batches: int or None
+            Total number of batches to process. If None, process all available data.
+        token_specific_error_types: list or None
+            List of error types ('resid', 'mlp', 'attn') for which to perform token-specific patching.
+            If None, all error types use global patching.
+        token_positions: list/range or None
+            Specific token positions to patch. If None, patch all token positions.
+        layers_to_patch: dict or None
+            Dictionary mapping error types to lists of layers to patch.
+            If None, patch all layers for all error types.
+        
+        Returns:
+        --------
+        dict
+            Dictionary mapping error types to patching scores
         """
+        # Set defaults
+        if token_specific_error_types is None:
+            token_specific_error_types = []  # Empty list means no token-specific patching
+        
         # Calculate how many total samples to process
         n_prompts, seq_len = clean_dataset['prompt'].shape
         assert n_prompts == clean_dataset['answer'].shape[0] == patched_dataset['answer'].shape[0]
@@ -192,9 +222,22 @@ class SFC_Gemma():
 
         if total_batches is None:
             total_batches = n_prompts // batch_size
-
             if n_prompts % batch_size != 0:
                 total_batches += 1
+        
+        # Set token positions to patch (default to all positions)
+        if token_positions is None:
+            token_positions = range(seq_len)
+        elif isinstance(token_positions, int):
+            token_positions = [token_positions]  # Convert single position to list
+            
+        # Initialize default layers to patch (all layers for all error types)
+        if layers_to_patch is None:
+            layers_to_patch = {
+                'resid': list(range(self.n_layers)),
+                'mlp': list(range(self.n_layers)),
+                'attn': list(range(self.n_layers)),
+            }
 
         # Utilities for getting hook names for activation errors and patching them
         def get_error_activation_name(error_type, error_layer):
@@ -209,23 +252,32 @@ class SFC_Gemma():
 
             return f'blocks.{error_layer}.{hook_name}.hook_sae_error'
 
-        def patched_to_clean_hook(act, hook, corrupted_cache):
+        # Global patching hook - patches all positions
+        def global_patching_hook(act, hook, corrupted_cache):
             try:
                 act[:] = corrupted_cache[hook.name][:]
             except KeyError as e:
                 raise KeyError(f"Activation {hook.name} not found in corrupted cache.") from e
             return act
 
-        # Initialize input and output data for patching
+        # Token-specific patching hook - patches only specified position
+        def token_specific_patching_hook(act, hook, corrupted_cache, position):
+            try:
+                # Copy only at the specified position, keeping dimensions intact
+                if 'hook_z' in hook.name:  # Handle attention's different dimensionality
+                    act[:, position, :, :] = corrupted_cache[hook.name][:, position, :, :]
+                else:
+                    act[:, position, :] = corrupted_cache[hook.name][:, position, :]
+            except KeyError as e:
+                raise KeyError(f"Activation {hook.name} not found in corrupted cache.") from e
+            return act
+
+        # Initialize result tensors - always use (n_layers, seq_len) shape for consistency
         model = self.model
-        all_normalized_logit_dif = { # this will contain patching results
-            'resid': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device),                
+        all_normalized_logit_dif = {
+            'resid': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device),
             'mlp': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device),
-            'attn': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device)}
-        layers_to_patch = {
-            'resid': list(range(self.n_layers)),
-            'mlp': list(range(self.n_layers)),
-            'attn': list(range(self.n_layers)),
+            'attn': torch.zeros((model.cfg.n_layers, seq_len), device=model.cfg.device)
         }
 
         # Loop over batches
@@ -247,41 +299,78 @@ class SFC_Gemma():
             corrupted_logit_diff = self.get_logit_diff(corrupted_logits, clean_answers=clean_answers,
                                                 patched_answers=corrupted_answers,
                                                 answer_pos=corrupted_answers_pos)            
-            # Computed the logit_dif baseline, that we'll use in the denominator later to compute the patching effects
+            # Compute the logit_dif baseline, that we'll use in the denominator later to compute the patching effects
             normalized_logit_dif_denom = torch.where(corrupted_logit_diff - clean_logit_diff == 0, 
                                                     torch.tensor(1, device=clean_logits.device), corrupted_logit_diff - clean_logit_diff)
-            # Define a hook to patch the corrupted activations (from the patched prompts) to the clean ones
-            # This matches the SFC metric
-            clean_cache_hook = partial(patched_to_clean_hook, corrupted_cache=corrupted_cache)
 
-            # Start patching for each error type (resid/mlp/attn) - outer loop
+            # Start patching for each error type
             for error_type in layers_to_patch.keys():
                 print(f'Computing patching effect for {error_type} errors...')
-
-                # Apply patching to selected layers for the given error type
-                for layer in tqdm(layers_to_patch[error_type]):
-                    # run_with_hooks applies a given hook and detaches it afterwards
-                    logits = model.run_with_hooks(clean_prompts, attention_mask=clean_attn_mask, fwd_hooks=[
-                        (get_error_activation_name(error_type, layer), clean_cache_hook)
-                    ])
+                
+                # Get the layers to patch for this error type
+                layers = layers_to_patch[error_type]
+                
+                # Check if this error type should use token-specific patching
+                if error_type in token_specific_error_types:
+                    print(f"  Using token-specific patching for {len(token_positions)} positions")
                     
-                    # Compute the logit diff for our patching run
-                    logit_diff = self.get_logit_diff(logits, clean_answers=clean_answers,
-                                                     patched_answers=corrupted_answers,
-                                                     answer_pos=clean_answers_pos)
+                    # Loop over layers
+                    for layer_idx, layer in enumerate(tqdm(layers)):
+                        # Loop over selected token positions
+                        for pos_idx, pos in enumerate(token_positions):
+                            # Create a position-specific patching hook
+                            pos_hook = lambda act, hook, cache=corrupted_cache, position=pos: token_specific_patching_hook(act, hook, cache, position)
+                            
+                            # Run with this position-specific hook
+                            logits = model.run_with_hooks(clean_prompts, attention_mask=clean_attn_mask, fwd_hooks=[
+                                (get_error_activation_name(error_type, layer), pos_hook)
+                            ])
+                            
+                            # Compute the logit diff for our patching run
+                            logit_diff = self.get_logit_diff(logits, clean_answers=clean_answers,
+                                                           patched_answers=corrupted_answers,
+                                                           answer_pos=clean_answers_pos)
+                            
+                            # Compute normalized logit diff
+                            normalized_logit_dif = (logit_diff - clean_logit_diff) / normalized_logit_dif_denom
+                            
+                            # Store the result for this specific position
+                            all_normalized_logit_dif[error_type][layer, pos] += normalized_logit_dif.mean(0)
+                            
+                            del logits, logit_diff, normalized_logit_dif
+                            clear_cache()
+                else:
+                    print(f"  Using global patching")
                     
-                    # Compare the logit diff against the baseline by computing the normalized logit diff
-                    # If it's close to 1: the patching effect was successful - the model started to behave as if it was called on the patched prompts
-                    # If it's close to 0: the patching effect had little to no effect
-                    normalized_logit_dif = (logit_diff - clean_logit_diff) / normalized_logit_dif_denom
-
-                    all_normalized_logit_dif[error_type][layer] += normalized_logit_dif.mean(0)
-
-                    del logits, logit_diff, normalized_logit_dif
-                    clear_cache() 
-            del clean_cache_hook, corrupted_cache, clean_logits, corrupted_logits, clean_logit_diff, corrupted_logit_diff, normalized_logit_dif_denom
+                    # Create a global patching hook
+                    global_hook = lambda act, hook, cache=corrupted_cache: global_patching_hook(act, hook, cache)
+                    
+                    # Loop over layers
+                    for layer_idx, layer in enumerate(tqdm(layers)):
+                        # Apply global patching
+                        logits = model.run_with_hooks(clean_prompts, attention_mask=clean_attn_mask, fwd_hooks=[
+                            (get_error_activation_name(error_type, layer), global_hook)
+                        ])
+                        
+                        # Compute the logit diff for our patching run
+                        logit_diff = self.get_logit_diff(logits, clean_answers=clean_answers,
+                                                       patched_answers=corrupted_answers,
+                                                       answer_pos=clean_answers_pos)
+                        
+                        # Compute normalized logit diff
+                        normalized_logit_dif = (logit_diff - clean_logit_diff) / normalized_logit_dif_denom
+                        
+                        # Store the result for global patching - broadcast to all token positions for this layer
+                        mean_effect = normalized_logit_dif.mean(0).item()
+                        all_normalized_logit_dif[error_type][layer, :] += mean_effect
+                        
+                        del logits, logit_diff, normalized_logit_dif
+                        clear_cache()
+                        
+            del corrupted_cache, clean_logits, corrupted_logits, clean_logit_diff, corrupted_logit_diff, normalized_logit_dif_denom
             clear_cache()
         
+        # Divide by total_batches to get the average
         for error_type in all_normalized_logit_dif.keys():
             all_normalized_logit_dif[error_type] /= total_batches
 
