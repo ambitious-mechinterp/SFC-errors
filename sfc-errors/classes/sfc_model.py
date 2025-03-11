@@ -8,9 +8,13 @@ from jaxtyping import Float, Int
 from torch import Tensor
 from enum import Enum
 from functools import partial
+from pathlib import Path
+import gc
+
+# Add import for SFC_NodeScores
+from .sfc_node_scores import SFC_NodeScores, AttributionAggregation
 
 # utility to clear variables out of the memory & and clearing cuda cache
-import gc
 def clear_cache():
     gc.collect()
     torch.cuda.empty_cache()
@@ -23,10 +27,6 @@ class NodeScoreType(Enum):
 class AttributionPatching(Enum):
     NORMAL = 'TRADITIONAL' # Approximates the effect of patching activations from patched run to the clean run
     ZERO_ABLATION = 'ZERO_ABLATION' # Approximates the effect of zeroing out activations from the patched/clean run
-
-class AttributionAggregation(Enum):
-    ALL_TOKENS = 'All_tokens'
-    NONE= 'None'
 
 ### Utility functions ###
 def sample_dataset(start_idx=0, end_idx=-1, clean_dataset=None, corrupted_dataset=None):
@@ -45,9 +45,14 @@ def sample_dataset(start_idx=0, end_idx=-1, clean_dataset=None, corrupted_datase
 class SFC_Gemma():
     def __init__(self, model, attach_saes=True, params_count=9, control_seq_len=1, caching_device=None,
                 sae_resid_release=None, sae_attn_release=None, sae_mlp_release=None,
-                sae_attn_width='16k', sae_mlp_width='16k', first_16k_resid_layers=None):
+                sae_attn_width='16k', sae_mlp_width='16k', first_16k_resid_layers=None,
+                data_dir=None, experiment_name=None):
         """
         Initializes the SFC_Gemma - wrapper around Gemma-2 models that can automatically load canonical SAEs and do SFC with them.
+        
+        Added parameters:
+            data_dir: Path to directory for saving/loading scores
+            experiment_name: Name of the experiment for saving/loading scores
         """
         if sae_resid_release is None:
             sae_resid_release = f'gemma-scope-{params_count}b-pt-res-canonical'
@@ -63,6 +68,8 @@ class SFC_Gemma():
         self.device = model.cfg.device
         self.caching_device = caching_device
         self.control_seq_len = control_seq_len
+        self.data_dir = data_dir
+        self.experiment_name = experiment_name
 
         if params_count == 9:
             self.model.set_use_attn_in(True)
@@ -108,6 +115,15 @@ class SFC_Gemma():
         ]
         self.saes = self.saes_dict['resid'] + self.saes_dict['mlp'] + self.saes_dict['attn']
         
+        # Initialize SFC_NodeScores with the same parameters
+        self.sfc_node_scores = SFC_NodeScores(
+            device=self.device,
+            caching_device=self.caching_device,
+            control_seq_len=self.control_seq_len,
+            data_dir=self.data_dir,
+            experiment_name=self.experiment_name
+        )
+        
         # Attach all SAEs
         if attach_saes:
             self.add_saes()
@@ -116,13 +132,17 @@ class SFC_Gemma():
         return self.model(*args, **kwargs)
 
     def compute_sfc_scores_for_templatic_dataset(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
-                                                 score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING, run_without_saes=True):
+                                                 score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING, run_without_saes=True,
+                                                 save_scores=True):
         """
         Main interface method for computing AtP scores for given clean and patched datasets.
         The method can run the model in two modes: with and without SAEs.
         1. With SAEs: the model be run with the attached SAEs, so that the gradients are computed automatically using PyTorch autograd.
         2. Without SAEs: the model will be run without SAEs, so that the gradients are computed analytically based on the stored activations.
         IMPORTANT: this requires the activations to be stored on the separate device (caching_device) to avoid OOM errors.
+        
+        Added parameters:
+            save_scores: Whether to save scores to data_dir/experiment_name
         """
         if run_without_saes:
             print('Running without SAEs, gradients and activations will be computed analytically.')
@@ -154,14 +174,20 @@ class SFC_Gemma():
 
                 metric_patched, cache_patched, _ = self.run_with_cache(corrupted_prompts, corrupted_attn_mask, metric_patched, 
                                                                        run_backward_pass=False, run_without_saes=run_without_saes)
-                # print('Fwd clean keys:', cache_clean.keys())
-                # print('Grad clean keys:', grad_clean.keys())
-                # print('Fwd patched keys:', cache_patched.keys())
 
                 if i == 0:
-                    node_scores = self.initialize_node_scores(cache_clean, run_without_saes=run_without_saes)
-                self.update_node_scores(node_scores, grad_clean, cache_clean, total_batches, 
-                                        cache_patched=cache_patched, attr_type=AttributionPatching.NORMAL, run_without_saes=run_without_saes)
+                    # Initialize node scores using SFC_NodeScores
+                    self.sfc_node_scores.initialize_node_scores(
+                        cache_clean, 
+                        run_without_saes=run_without_saes,
+                        d_sae_lookup_fn=self.key_to_d_sae,
+                        hook_name_to_sae_act_name_fn=self.hook_name_to_sae_act_name
+                    )
+                    
+                # Use our helper methods to update node scores
+                self._update_node_scores(grad_clean, cache_clean, total_batches, 
+                                        cache_patched=cache_patched, attr_type=AttributionPatching.NORMAL, 
+                                        run_without_saes=run_without_saes)
 
                 del grad_clean
             elif score_type == NodeScoreType.INTEGRATED_GRADIENTS:
@@ -175,12 +201,16 @@ class SFC_Gemma():
 
         clean_metric = torch.tensor(metrics_clean_scores).mean().item()
         patched_metric = torch.tensor(metrics_patched).mean().item()
+        
+        # Save scores if requested
+        if save_scores and self.data_dir is not None and self.experiment_name is not None:
+            self.sfc_node_scores.save_scores(mode="sfc")
 
         return (
             clean_metric, patched_metric,
-            node_scores
+            self.sfc_node_scores.node_scores
         )
-
+    
     def compute_act_patching_scores_for_errors(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
                                                token_specific_error_types=None, token_positions=None, layers_to_patch=None):
         """
@@ -639,105 +669,35 @@ class SFC_Gemma():
                     grad_cache[hook.name] = gradient.detach()
 
         self.model.add_hook(bwd_hook_filter, backward_cache_hook, "bwd")
-
-    def initialize_node_scores(self, cache: ActivationCache, score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING,
-                              run_without_saes=True):
-        """
-        Initialized a dictionary of all the SFC node stores. 
-        The keys are of the form
-        'blocks.<layer_num>.<hook_name>.hook_sae_acts_post' (in case of SAE latents) or
-        'blocks.<layer_num>.<hook_name>.hook_sae_error' (in case of SAE error terms).
-
-        The values are 
-        - tensors of shape [pos, d_sae] for SAE latents
-        - tensors of shape [pos] for SAE error terms
-
-        These tensors are initialized to zero and will be updated in the update_node_scores method.
-        """
-        node_scores = {}
-        
-        for key, cache_tensor in cache.items():
-            # A node is either an SAE latent or an SAE error terms
-            # Here it's represented as the hook-point name - cache key
-
-            if run_without_saes:
-                d_sae = self.key_to_d_sae(key)
-
-                # cache is of shape [batch pos d_act] if not an attn hook, [batch pos n_head d_head] otherwise
-                if 'hook_z' not in key:
-                    batch, pos, d_act = cache_tensor.shape
-                else:
-                    batch, pos, n_head, d_act = cache_tensor.shape
-
-                sae_latent_name, sae_error_name = self.hook_name_to_sae_act_name(key)
-
-                node_scores[sae_error_name] = torch.zeros((pos), dtype=torch.bfloat16, device=self.caching_device)
-                node_scores[sae_latent_name] = torch.zeros((pos, d_sae), dtype=torch.bfloat16, device=self.caching_device)
-
-                # if '.0.' in key:
-                #     print(f'Initialized scores for {key} with {sae_error_name} of shape {node_scores[sae_error_name].shape} and {sae_latent_name} of shape {node_scores[sae_latent_name].shape}.')
-            else:
-                if 'hook_z.hook_sae_error' not in key:
-                    batch, pos, d_act = cache_tensor.shape
-                else:
-                    batch, pos, n_head, d_act = cache_tensor.shape
-
-                if 'hook_sae_error' in key:
-                    # An "importance value" for the SAE error is scalar - it's a single node
-                    node_scores[key] = torch.zeros((pos), dtype=torch.bfloat16, device=self.device)
-                else:
-                    # An "importance value" for SAE latents is a vector with length d_sae (d_act)
-                    node_scores[key] = torch.zeros((pos, d_act), dtype=torch.bfloat16, device=self.device)
-
-        return node_scores
     
-    def aggregate_node_scores(self, node_scores, aggregation_type):
-        # print(f'Aggregating scores with type {aggregation_type}.')
-
-        for key, score_tensor in node_scores.items():
-            score_tensor_filtered = score_tensor[self.control_seq_len:]
-            if aggregation_type.value == AttributionAggregation.ALL_TOKENS.value:
-                # print(f'Aggregating scores for {key} with shape {score_tensor_filtered.shape}.')
-                score_tensor_aggregated = score_tensor_filtered.sum(0)
-                # print(f'Aggregated scores for {key} with shape {score_tensor_aggregated.shape}.')
-            else:
-                score_tensor_aggregated = score_tensor_filtered
-
-            node_scores[key] = score_tensor_aggregated
-    
-    def update_node_scores(self, node_scores: ActivationCache, grad_cache: ActivationCache, cache_clean: ActivationCache, total_batches,
-                           cache_patched=None, attr_type=AttributionPatching.NORMAL, run_without_saes=True, batch_reduce='mean'):
+    def _update_node_scores(self, grad_cache, cache_clean, total_batches,
+                           cache_patched=None, attr_type=AttributionPatching.NORMAL, 
+                           run_without_saes=True, batch_reduce='mean'):
         """
-        Method where the node scores are updated based on the gradients and the cached activations.
-        The node scores are updated in place, so the method doesn't return anything.
-
-        There are two modes of operation:
-        1. run_without_saes=True: the model is run without SAEs, so the gradients are computed analytically based on the cached activations.
-        2. run_without_saes=False: the model is run with SAEs, so the gradients w.r.t. SAE latents and error terms are computed 
-        using PyTorch autograd.
-
-        Depending on the mode, the method will call either update_node_scores_no_saes_run or update_node_scores_saes_run.
+        Helper method that delegates node score updates to the appropriate method 
+        based on whether SAEs are attached.
         """
         if attr_type.value == AttributionPatching.NORMAL.value:
             assert cache_patched is not None, 'Patched cache must be provided for normal attribution patching.'
             
         if not run_without_saes:
-            self.update_node_scores_saes_run(node_scores, grad_cache, cache_clean, total_batches, cache_patched=cache_patched,
-                                             attr_type=attr_type, batch_reduce=batch_reduce)
+            self._update_node_scores_saes_run(grad_cache, cache_clean, total_batches, 
+                                             cache_patched=cache_patched, attr_type=attr_type, 
+                                             batch_reduce=batch_reduce)
         else:
-            self.update_node_scores_no_saes_run(node_scores, grad_cache, cache_clean, total_batches, cache_patched=cache_patched,
-                                                attr_type=attr_type, batch_reduce=batch_reduce)
-            
-    def update_node_scores_no_saes_run(self, node_scores: ActivationCache, clean_grad, cache_clean, total_batches,
-                                       cache_patched=None, attr_type=AttributionPatching.NORMAL, batch_reduce='mean'):
+            self._update_node_scores_no_saes_run(grad_cache, cache_clean, total_batches, 
+                                               cache_patched=cache_patched, attr_type=attr_type, 
+                                               batch_reduce=batch_reduce)
+    
+    def _update_node_scores_no_saes_run(self, clean_grad, cache_clean, total_batches,
+                                       cache_patched=None, attr_type=AttributionPatching.NORMAL, 
+                                       batch_reduce='mean'):
         """
         Method that computes the AtP scores for the current batch, assuming that the model is run without SAEs attached.
-        This meants that we'll FIRST need to compute the SAE latents and error terms activations AND gradients, and then
-        compute the scores based on them. This is performed inside the compute_score_update, which is called for each activation 
-        (resid, attn, mlp). 
-
-        The method updates the node scores in place, so it doesn't return anything.
+        This means that we'll FIRST need to compute the SAE latents and error terms activations AND gradients, and then
+        compute the scores based on them.
         """
+        node_scores = self.sfc_node_scores.node_scores
 
         def compute_score_update(key):
             """
@@ -752,7 +712,6 @@ class SFC_Gemma():
 
             # Step-1: Compute the SAE latents and error terms
             sae = self.get_sae_by_hook_name(key)
-            # print(f'Using {sae.cfg.hook_name} SAE for activation {key}.')
 
             sae_latents_act_clean = sae.encode(clean_acts)
             sae_out_clean = sae.decode(sae_latents_act_clean)
@@ -789,7 +748,7 @@ class SFC_Gemma():
             error_score_update = einops.einsum(sae_error_grad, activation_term_error,
                                                'batch pos d_act, batch pos d_act -> batch pos')
             
-            # # SAE latents case: we want a score per each feature, so we're keeping the d_sae dimension
+            # SAE latents case: we want a score per each feature, so we're keeping the d_sae dimension
             latents_score_update = sae_latent_grad * (activation_term_latents) # shape [batch pos d_sae]
 
             return latents_score_update, error_score_update
@@ -800,8 +759,6 @@ class SFC_Gemma():
         for key in cache_clean.keys():
             latents_score_update, error_score_update = compute_score_update(key)
             sae_acts_post_name, sae_error_name = self.hook_name_to_sae_act_name(key)
-
-            # print(f'Updating scores for {key} with latents_score_update of shape {latents_score_update.shape} and error_score_update of shape {error_score_update.shape}.')
 
             if batch_reduce == 'sum':
                 latents_score_update = latents_score_update.sum(0)
@@ -816,14 +773,14 @@ class SFC_Gemma():
                 node_scores[sae_acts_post_name] += latents_score_update / total_batches
                 node_scores[sae_error_name] += error_score_update / total_batches
 
-    def update_node_scores_saes_run(self, node_scores: ActivationCache, clean_grad, cache_clean, total_batches, 
-                           cache_patched=None, batch_reduce='mean', attr_type=AttributionPatching.NORMAL):
+    def _update_node_scores_saes_run(self, clean_grad, cache_clean, total_batches, 
+                               cache_patched=None, batch_reduce='mean', attr_type=AttributionPatching.NORMAL):
         """
         Computes the attribution patching scores for the current batch, assuming that the model is run with SAEs attached.
         This means that we just need to multiply the gradients w.r.t. the SAE latents and error terms with the activation terms.
-
-        The method updates the node scores in place, so it doesn't return anything.
         """
+        node_scores = self.sfc_node_scores.node_scores
+        
         for key in node_scores.keys():
             if attr_type.value == AttributionPatching.NORMAL.value:
                 activation_term = cache_patched[key] - cache_clean[key]
@@ -925,6 +882,37 @@ class SFC_Gemma():
 
         return sae_acts_post, sae_error
     
+    def _sae_act_name_to_hook_name(self, sae_act_name):
+        """
+        Convert a SAE activation name (hook_sae_acts_post or hook_sae_error) back to the original hook name.
+        This is the inverse of hook_name_to_sae_act_name.
+        """
+        # Split the input string by periods
+        parts = sae_act_name.split('.')
+        
+        # Validate the input format
+        if len(parts) < 3 or parts[0] != 'blocks':
+            raise ValueError("Input string must start with 'blocks.<index>.'")
+            
+        # Extract the index and hook_name without the SAE suffix
+        index = parts[1]
+        hook_name_parts = []
+        
+        # Extract the hook name parts before ".hook_sae_acts_post" or ".hook_sae_error"
+        for part in parts[2:]:
+            if 'hook_sae_acts_post' in part:
+                hook_name_parts.append(part.split('.hook_sae_acts_post')[0])
+                break
+            elif 'hook_sae_error' in part:
+                hook_name_parts.append(part.split('.hook_sae_error')[0])
+                break
+            else:
+                hook_name_parts.append(part)
+        
+        # Construct the original hook name
+        original_hook_name = f"blocks.{index}.{'.'.join(hook_name_parts)}"
+        return original_hook_name
+    
     def hook_name_to_layer_number(self, hook_name):
         # Split the input string by periods
         parts = hook_name.split('.')
@@ -954,39 +942,6 @@ class SFC_Gemma():
     def add_saes(self):
         for sae in self.saes:
             self.model.add_sae(sae, use_error_term=True)
-
-    def detach_saes_except_few(self, act_names_for_which_to_keep_saes, discard_saes=True):
-        self.model.reset_saes()
-        assert not self.are_saes_attached(), 'SAEs are not detached from the model.'
-
-        original_saes_count = len(self.saes)
-        # Now only load SAEs for the specified act names
-        self.saes = []
-
-        for act_name in act_names_for_which_to_keep_saes:
-            try:
-                sae = self.get_sae_by_hook_name(act_name)
-            except ValueError as e:
-                print(f'Skipping the act name {act_name} because there\'s no SAE for it. Consider reinitializing the SFC_Gemma object.')
-                continue
-
-            self.model.add_sae(sae, use_error_term=True)
-            self.saes.append(sae)
-
-        new_saes_count = len(self.saes)
-        print(f'Detached {original_saes_count - new_saes_count} SAEs from the model.')
-
-        # Discard the remaining SAEs from memory
-        if discard_saes:
-            try:
-                del self.saes_dict
-            except AttributeError:
-                pass
-            finally:
-                clear_cache()
-                print('Discarded the remaining SAEs from memory.')
-
-        assert self.are_saes_attached(), 'SAEs should be attached to the model.'
 
     def print_saes(self):
         if not self.are_saes_attached():
