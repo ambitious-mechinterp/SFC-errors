@@ -1,6 +1,8 @@
 # Data
-/data/
-sfc-errors/data
+/data/*
+
+# But allow rc_train_filtered.json <- this is a light SFC dataset
+!/data/rc_train_filtered.json
 
 # Mac OS-specific storage files
 .DS_Store

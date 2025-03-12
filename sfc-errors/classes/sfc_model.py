@@ -1,12 +1,12 @@
 from transformer_lens import ActivationCache
-from sae_lens import SAE, HookedSAETransformer
+from sae_lens import SAE
 import torch
-import numpy as np
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 import einops
 from jaxtyping import Float, Int
 from torch import Tensor
 from enum import Enum
+from utils.error_patching import compute_error_patching_scores
 
 # utility to clear variables out of the memory & and clearing cuda cache
 import gc
@@ -114,8 +114,8 @@ class SFC_Gemma():
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
-    def compute_node_scores_for_normal_patching(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
-                                                score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING, run_without_saes=True):
+    def compute_sfc_scores_for_templatic_dataset(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
+                                                 score_type: NodeScoreType = NodeScoreType.ATTRIBUTION_PATCHING, run_without_saes=True):
         """
         Main interface method for computing AtP scores for given clean and patched datasets.
         The method can run the model in two modes: with and without SAEs.
@@ -180,9 +180,191 @@ class SFC_Gemma():
             node_scores
         )
 
+    def compute_act_patching_scores_for_errors(self, clean_dataset, patched_dataset, batch_size=50, total_batches=None,
+                                               token_specific_error_types=None, token_positions=None, layers_to_patch=None):
+        """
+        Compute activation patching scores for SAE error terms.
+        This method is a wrapper around the standalone compute_error_patching_scores function, so consult the documentation there for more details.
+        """
+        
+        # Create a function that accesses the instance method get_logit_diff
+        get_logit_diff_fn = lambda logits, clean_answers, patched_answers, answer_pos: self.get_logit_diff(
+            logits, clean_answers, patched_answers, answer_pos
+        )
+        
+        # Call the standalone function with appropriate parameters
+        return compute_error_patching_scores(
+            model=self.model,
+            clean_dataset=clean_dataset,
+            patched_dataset=patched_dataset,
+            get_logit_diff_fn=get_logit_diff_fn,
+            batch_size=batch_size,
+            total_batches=total_batches,
+            token_specific_error_types=token_specific_error_types,
+            token_positions=token_positions,
+            layers_to_patch=layers_to_patch
+        )
+
+    def compute_activation_analysis(self, clean_dataset, patched_dataset, activation_types=['sae_error'], batch_size=50, total_batches=None):
+        """
+        Computes analysis of model activations by returning:
+        1. Norm of activation difference (patched - clean)
+        2. Norm of gradient for each activation
+        3. Attribution patching score (dot product of the above)
+        
+        This allows for visualization to understand the relationship between activation
+        differences and gradients in model components.
+        
+        Args:
+            clean_dataset: Dataset with clean prompts
+            patched_dataset: Dataset with patched prompts
+            activation_types: List of activation types to analyze. Default is ['sae_error']
+            batch_size: Number of samples to process in each batch
+            total_batches: Total number of batches to process (None means process all)
+        
+        Returns:
+            dict: Dictionary with keys corresponding to activation points and values being tuples of
+                (activation_diff_norm, gradient_norm, atp_score)
+        """
+        # Ensure SAEs are attached
+        if not self.are_saes_attached():
+            raise ValueError("This method requires SAEs to be attached. Call add_saes() first.")
+        
+        # Define activation types to analyze
+        if activation_types is None:
+            activation_types = ['sae_error', 'resid_post']
+        
+        # Calculate how many total samples to process
+        n_prompts, seq_len = clean_dataset['prompt'].shape
+        assert n_prompts == clean_dataset['answer'].shape[0] == patched_dataset['answer'].shape[0]
+        
+        prompts_to_process = n_prompts if total_batches is None else batch_size * total_batches
+        
+        if total_batches is None:
+            total_batches = n_prompts // batch_size
+            if n_prompts % batch_size != 0:
+                total_batches += 1
+        
+        # Initialize data structures to store results
+        activation_data = {}
+        
+        # Define filters for forward and backward hooks based on activation types
+        fwd_filters = []
+        bwd_filters = []
+        
+        if 'sae_error' in activation_types:
+            fwd_filters.append(lambda name: 'hook_sae_error' in name)
+        
+        if 'resid_post' in activation_types:
+            fwd_filters.append(lambda name: name.endswith('hook_resid_post.hook_sae_input'))
+
+        # 'hook_sae_output' and 'hook_sae_input' are used in both cases to ensure correct gradient computation with SAEs attached
+        bwd_filters.append(lambda name: 'hook_sae_output' in name)
+        bwd_filters.append(lambda name: 'hook_sae_input' in name)
+        
+        # Combine all filters
+        fwd_cache_filter = lambda name: any(f(name) for f in fwd_filters)
+        bwd_cache_filter = lambda name: any(f(name) for f in bwd_filters)
+        
+        # Process each batch
+        for i in tqdm(range(0, prompts_to_process, batch_size)):
+            clean_prompts, corrupted_prompts, clean_answers, corrupted_answers, clean_answers_pos, corrupted_answers_pos, \
+            clean_attn_mask, corrupted_attn_mask = sample_dataset(i, i + batch_size, clean_dataset, patched_dataset)
+            
+            # Define metrics for clean and patched runs
+            metric_clean = lambda logits: self.get_logit_diff(logits, clean_answers, corrupted_answers, clean_answers_pos).mean()
+            
+            # Run clean model with cache to get gradients and activations
+            metric_clean_val, cache_clean, grad_clean = self.run_with_cache(
+                clean_prompts, 
+                clean_attn_mask, 
+                metric_clean,
+                fwd_cache_filter=fwd_cache_filter,
+                bwd_cache_filter=bwd_cache_filter,
+                bwd_activations_to_cache=activation_types,
+                run_backward_pass=True,
+                run_without_saes=False
+            )
+            
+            # Run patched model with cache to get activations (no gradients needed)
+            metric_patched_val, cache_patched, _ = self.run_with_cache(
+                corrupted_prompts,
+                corrupted_attn_mask,
+                lambda logits: self.get_logit_diff(logits, clean_answers, corrupted_answers, corrupted_answers_pos).mean(),
+                fwd_cache_filter=fwd_cache_filter,
+                run_backward_pass=False,
+                run_without_saes=False
+            )
+            
+            # Initialize data structure for this batch
+            batch_data = {}
+            
+            # Process each activation point
+            for key in cache_clean.keys():
+                # Get activation difference between patched and clean
+                activation_diff = cache_patched[key] - cache_clean[key]
+                
+                # Check if gradient exists for this key
+                if key not in grad_clean:
+                    print(f"Warning: No gradient found for {key}. Available keys: {list(grad_clean.keys())[:5]}...")
+                    continue
+                
+                gradient = grad_clean[key]
+                
+                # Reshape the attention hook activations & gradients to flatten the n_head dimension if needed
+                if 'hook_z' in key:
+                    activation_diff = einops.rearrange(activation_diff, 
+                                                    'batch pos n_head d_head -> batch pos (n_head d_head)')
+                    gradient = einops.rearrange(gradient,
+                                            'batch pos n_head d_head -> batch pos (n_head d_head)')
+                
+                # Compute our analysis metrics: norms of activation difference and gradient, and AtP score
+                activation_diff_norm = torch.norm(activation_diff, dim=-1)  # Norm across model dimension
+                gradient_norm = torch.norm(gradient, dim=-1)  # Norm across model dimension
+                atp_score = einops.einsum(gradient, activation_diff, 'batch pos d_act, batch pos d_act -> batch pos')
+                
+                # Store results for this activation point in this batch
+                if key not in batch_data:
+                    batch_data[key] = []
+                
+                # Store as tuple (activation_diff_norm, gradient_norm, atp_score)
+                batch_data[key].append((activation_diff_norm, gradient_norm, atp_score))
+
+                # del activation_diff, gradient
+                # clear_cache()
+            
+            # Update main data structure with batch results
+            for key, batch_tuples in batch_data.items():
+                if key not in activation_data:
+                    activation_data[key] = []
+                activation_data[key].extend(batch_tuples)
+            
+            # Clean up to prevent memory issues
+            del cache_clean, cache_patched, grad_clean, batch_data
+            clear_cache()
+        
+        # Aggregate results across batches
+        aggregated_data = {}
+        for key, tuples_list in activation_data.items():
+            # Concatenate all batch data
+            activation_diff_norms = torch.cat([t[0] for t in tuples_list], dim=0)
+            gradient_norms = torch.cat([t[1] for t in tuples_list], dim=0)
+            atp_scores = torch.cat([t[2] for t in tuples_list], dim=0)
+            
+            # Average across batch dimension
+            activation_diff_norms_mean = activation_diff_norms.mean(dim=0)  # Shape: [pos]
+            gradient_norms_mean = gradient_norms.mean(dim=0)  # Shape: [pos]
+            atp_scores_mean = atp_scores.mean(dim=0)  # Shape: [pos]
+            
+            # Store aggregated results
+            aggregated_data[key] = (activation_diff_norms_mean, gradient_norms_mean, atp_scores_mean)
+        
+        return aggregated_data
+
     def run_with_cache(self, tokens: Int[Tensor, "batch pos"],
                        attn_mask: Int[Tensor, "batch pos"], metric,
-                       fwd_cache_filter=None, bwd_cache_filter=None, run_backward_pass=True, run_without_saes=False):
+                       fwd_cache_filter=None, bwd_cache_filter=None, bwd_activations_to_cache=['sae_error'], 
+                       run_backward_pass=True, run_without_saes=False):
         """
         Runs the model on the given tokens and stores the relevant forward and backward caches.
         The default behavior varies depending on the run_without_saes flag:
@@ -214,7 +396,8 @@ class SFC_Gemma():
 
         try:
             if run_backward_pass:
-                self._set_backward_hooks(grad_cache, bwd_cache_filter, compute_grad_analytically=run_without_saes)
+                self._set_backward_hooks(grad_cache, bwd_cache_filter, compute_grad_analytically=run_without_saes, 
+                                         activations_to_cache=bwd_activations_to_cache)
 
                 # Enable gradients only during the backward pass
                 with torch.set_grad_enabled(True):
@@ -237,7 +420,8 @@ class SFC_Gemma():
             ActivationCache(grad_cache, self.model).to(self.caching_device),
         )
 
-    def _set_backward_hooks(self, grad_cache, bwd_hook_filter=None, compute_grad_analytically=False):
+    def _set_backward_hooks(self, grad_cache, bwd_hook_filter=None, compute_grad_analytically=False, 
+                            activations_to_cache=['sae_error']):
         if bwd_hook_filter is None:
             if compute_grad_analytically:
                 bwd_hook_filter = lambda name: 'resid_post' in name or 'attn.hook_z' in name or 'mlp_out' in name
@@ -255,10 +439,13 @@ class SFC_Gemma():
             def backward_cache_hook(gradient, hook):
                 if 'hook_sae_output' in hook.name:
                     hook_sae_error_name = hook.name.replace('hook_sae_output', 'hook_sae_error')
-                    grad_cache[hook_sae_error_name] = gradient.detach()
+
+                    # Optionally store the gradients for the SAE error terms
+                    if any([act_name in hook_sae_error_name for act_name in activations_to_cache]):
+                        grad_cache[hook_sae_error_name] = gradient.detach()
 
                     # We're storing the gradients for the SAE output activations to copy them to the SAE input activations gradients
-                    if not 'hook_z' in hook.name:
+                    if 'hook_z' not in hook.name:
                         temp_cache[hook.name] = gradient.detach()
                     else: # In the case of attention hook_z hooks, reshape them to match the SAE input shape, which doesn't include n_heads
                         hook_z_grad = einops.rearrange(gradient.detach(),
@@ -268,8 +455,11 @@ class SFC_Gemma():
                     # We're copying the gradients from the SAE output activations to the SAE input activations gradients
                     sae_output_grad_name = hook.name.replace('hook_sae_input', 'hook_sae_output')
 
-                    grad_cache[hook.name] = temp_cache[sae_output_grad_name]
-                    gradient = grad_cache[hook.name]
+                    gradient = temp_cache[sae_output_grad_name] # this ensures that gradient propagation is unaffected by SAEs
+
+                    # Optionally store the gradients for the SAE input activations
+                    if any([act_name in hook.name for act_name in activations_to_cache]):
+                        grad_cache[hook.name] = gradient.detach()
 
                     # Pass-through: use the downstream gradients
                     return (gradient,)
@@ -593,39 +783,6 @@ class SFC_Gemma():
     def add_saes(self):
         for sae in self.saes:
             self.model.add_sae(sae, use_error_term=True)
-
-    def detach_saes_except_few(self, act_names_for_which_to_keep_saes, discard_saes=True):
-        self.model.reset_saes()
-        assert not self.are_saes_attached(), 'SAEs are not detached from the model.'
-
-        original_saes_count = len(self.saes)
-        # Now only load SAEs for the specified act names
-        self.saes = []
-
-        for act_name in act_names_for_which_to_keep_saes:
-            try:
-                sae = self.get_sae_by_hook_name(act_name)
-            except ValueError as e:
-                print(f'Skipping the act name {act_name} because there\'s no SAE for it. Consider reinitializing the SFC_Gemma object.')
-                continue
-
-            self.model.add_sae(sae, use_error_term=True)
-            self.saes.append(sae)
-
-        new_saes_count = len(self.saes)
-        print(f'Detached {original_saes_count - new_saes_count} SAEs from the model.')
-
-        # Discard the remaining SAEs from memory
-        if discard_saes:
-            try:
-                del self.saes_dict
-            except AttributeError:
-                pass
-            finally:
-                clear_cache()
-                print('Discarded the remaining SAEs from memory.')
-
-        assert self.are_saes_attached(), 'SAEs should be attached to the model.'
 
     def print_saes(self):
         if not self.are_saes_attached():
