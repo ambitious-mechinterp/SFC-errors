@@ -30,3 +30,8 @@ exclude = '''
 [tool.ruff.lint.isort]
 known-first-party = ["sfc-errors"]
 force-sort-within-sections = true
+
+[tool.ruff]
+ignore = ["E731", # enable lambda expressions
+          "F722", "F821" # avoid bugs with type annotations
+          ]

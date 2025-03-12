@@ -1,13 +1,11 @@
 from transformer_lens import ActivationCache
-from sae_lens import SAE, HookedSAETransformer
+from sae_lens import SAE
 import torch
-import numpy as np
 from tqdm.notebook import tqdm
 import einops
 from jaxtyping import Float, Int
 from torch import Tensor
 from enum import Enum
-from functools import partial
 
 # utility to clear variables out of the memory & and clearing cuda cache
 import gc
@@ -340,7 +338,7 @@ class SFC_Gemma():
                             del logits, logit_diff, normalized_logit_dif
                             clear_cache()
                 else:
-                    print(f"  Using global patching")
+                    print("  Using global patching")
                     
                     # Create a global patching hook
                     global_hook = lambda act, hook, cache=corrupted_cache: global_patching_hook(act, hook, cache)
@@ -616,7 +614,7 @@ class SFC_Gemma():
                         grad_cache[hook_sae_error_name] = gradient.detach()
 
                     # We're storing the gradients for the SAE output activations to copy them to the SAE input activations gradients
-                    if not 'hook_z' in hook.name:
+                    if 'hook_z' not in hook.name:
                         temp_cache[hook.name] = gradient.detach()
                     else: # In the case of attention hook_z hooks, reshape them to match the SAE input shape, which doesn't include n_heads
                         hook_z_grad = einops.rearrange(gradient.detach(),
@@ -966,7 +964,7 @@ class SFC_Gemma():
         for act_name in act_names_for_which_to_keep_saes:
             try:
                 sae = self.get_sae_by_hook_name(act_name)
-            except ValueError as e:
+            except ValueError:
                 print(f'Skipping the act name {act_name} because there\'s no SAE for it. Consider reinitializing the SFC_Gemma object.')
                 continue
 
