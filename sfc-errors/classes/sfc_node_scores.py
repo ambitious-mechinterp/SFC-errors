@@ -40,10 +40,9 @@ class SFC_NodeScores:
         self.experiment_name = experiment_name
         
         # Node scores dictionaries
-        self.node_scores = None  # SFC scores - non-aggregated
-        self.aggregated_node_scores = None  # SFC scores - aggregated
-        self.mean_activations = None  # Mean activations - non-aggregated
-        self.aggregated_mean_activations = None  # Mean activations - aggregated
+        self.node_scores = None  # SFC scores - non-aggregated [pos, ...]
+        self.aggregated_node_scores = None  # SFC scores - aggregated (sum over positions)
+        self.mean_activations = None  # Mean activations - non-aggregated [pos, ...]
         
         # Load saved scores if needed
         if load_if_exists and data_dir is not None and experiment_name is not None:
@@ -116,12 +115,12 @@ class SFC_NodeScores:
         
         for key, cache_tensor in cache.items():
             # For SAEs attached case (run_without_saes=False), initialize with zeros of the same shape
-            if 'hook_z.hook_sae_error' not in key and 'hook_z.hook_sae_acts_post' not in key:
+            if 'hook_z.hook_sae_error' not in key:
                 # Regular nodes (non-attention)
                 batch, pos, d_act = cache_tensor.shape
                 mean_activations[key] = torch.zeros((pos, d_act), dtype=torch.bfloat16, device=self.device)
             else:
-                # Attention nodes
+                # Attention error nodes
                 batch, pos, n_head, d_head = cache_tensor.shape
                 mean_activations[key] = torch.zeros((pos, n_head, d_head), dtype=torch.bfloat16, device=self.device)
                 
@@ -164,19 +163,35 @@ class SFC_NodeScores:
             
         self.aggregated_node_scores = self.aggregate_scores(self.node_scores, aggregation_type)
         return self.aggregated_node_scores
-    
-    def aggregate_mean_activations(self, aggregation_type=AttributionAggregation.ALL_TOKENS):
+
+    def select_node_scores(self, selection_fn, scores_type='sfc'):
         """
-        Aggregate mean_activations across token positions.
+        Select node scores based on a selection function.
         
         Args:
-            aggregation_type: Type of aggregation to perform
+            scores_type: Type of scores to select from. Can be 'sfc' or 'mean_act'
+            selection_fn: Boolean function called on node names that returns True for selected nodes
+        Returns:
+            Dictionary of selected node scores
+
+        Notes:
+            - The node names are the keys of the node_scores dictionary (e.g. 'blocks.0.hook_resid_post.hook_sae_error).
+            - The function doesn't make any copies of the score tensors, so modyfying the returned tensors will modify the original node_scores.
         """
-        if self.mean_activations is None:
+        if scores_type == 'sfc' and self.node_scores is None:
+            raise ValueError("Node scores have not been initialized")
+        elif scores_type == 'mean_act' and self.mean_activations is None:
             raise ValueError("Mean activations have not been initialized")
+        elif scores_type not in ['sfc', 'mean_act']:
+            raise ValueError("Invalid scores_type. Must be 'sfc' or 'mean_act'")
+
+        if scores_type == 'sfc':
+            scores_dict = self.node_scores
+        elif scores_type == 'mean_act':
+            scores_dict = self.mean_activations
             
-        self.aggregated_mean_activations = self.aggregate_scores(self.mean_activations, aggregation_type)
-        return self.aggregated_mean_activations
+        selected_node_scores = {key: score for key, score in scores_dict.items() if selection_fn(key)}
+        return selected_node_scores
     
     def save_scores(self, mode="all"):
         """
@@ -198,7 +213,6 @@ class SFC_NodeScores:
             "has_sfc_scores": self.node_scores is not None,
             "has_aggregated_sfc_scores": self.aggregated_node_scores is not None, 
             "has_mean_activations": self.mean_activations is not None,
-            "has_aggregated_mean_activations": self.aggregated_mean_activations is not None,
         }
         
         with open(save_dir / "metadata.json", "w") as f:
@@ -206,16 +220,16 @@ class SFC_NodeScores:
         
         # Save scores
         if (mode == "all" or mode == "sfc") and self.node_scores is not None:
+            print(f"Saving SFC scores to {save_dir}")
             self._save_tensor_dict(self.node_scores, save_dir / "sfc_scores.pkl")
             
         if (mode == "all" or mode == "sfc") and self.aggregated_node_scores is not None:
+            print(f"Saving aggregated SFC scores to {save_dir}")
             self._save_tensor_dict(self.aggregated_node_scores, save_dir / "aggregated_sfc_scores.pkl")
             
         if (mode == "all" or mode == "mean_act") and self.mean_activations is not None:
+            print(f"Saving mean activations to {save_dir}")
             self._save_tensor_dict(self.mean_activations, save_dir / "mean_activations.pkl")
-            
-        if (mode == "all" or mode == "mean_act") and self.aggregated_mean_activations is not None:
-            self._save_tensor_dict(self.aggregated_mean_activations, save_dir / "aggregated_mean_activations.pkl")
     
     def load_scores(self, map_location=None):
         """
@@ -250,8 +264,7 @@ class SFC_NodeScores:
         file_paths = {
             "sfc_scores": [load_dir / "sfc_scores.pkl", load_dir / "sfc_scores.pt"],
             "aggregated_sfc_scores": [load_dir / "aggregated_sfc_scores.pkl", load_dir / "aggregated_sfc_scores.pt"],
-            "mean_activations": [load_dir / "mean_activations.pkl", load_dir / "mean_activations.pt"],
-            "aggregated_mean_activations": [load_dir / "aggregated_mean_activations.pkl", load_dir / "aggregated_mean_activations.pt"]
+            "mean_activations": [load_dir / "mean_activations.pkl", load_dir / "mean_activations.pt"]
         }
         
         # Try loading from each possible path
@@ -267,9 +280,6 @@ class SFC_NodeScores:
                     elif score_type == "mean_activations":
                         self.mean_activations = self._load_tensor_dict(path, map_location)
                         print(f"Loaded mean activations from {path}")
-                    elif score_type == "aggregated_mean_activations":
-                        self.aggregated_mean_activations = self._load_tensor_dict(path, map_location)
-                        print(f"Loaded aggregated mean activations from {path}")
                     break  # Once loaded, move to next score type
     
     def _save_tensor_dict(self, tensor_dict, path):
