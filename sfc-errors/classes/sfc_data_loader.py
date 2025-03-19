@@ -1,5 +1,5 @@
 from datasets import load_dataset, Dataset
-from utils.enums import SpecialTokens, SupportedDatasets
+from utils.enums import SpecialTokens, SupportedDatasets, DatasetCategory
 import torch
 import random
 from tqdm import tqdm
@@ -248,7 +248,7 @@ class SFCDatasetLoader:
         return prompt, special_token_mask
 
     def get_formatted_prompt(self, item, system_prompt, task_prompt, patched=False):
-        if self.dataset_name in [SupportedDatasets.COMMONSENSE_QA, SupportedDatasets.COMMONSENSE_QA_FILTERED]:
+        if self.dataset_name.category == DatasetCategory.QA:
             choices = [
                 f"{label}) {text}" 
                 for label, text in zip(item['choices']['label'], item['choices']['text'])
@@ -261,32 +261,33 @@ class SFCDatasetLoader:
                 f'\n{task_prompt}'
             )
             return prompt
-        elif self.dataset_name == SupportedDatasets.VERB_AGREEMENT:
+        elif self.dataset_name.category == DatasetCategory.AGREEMENT:
             if not patched:
                 return item['clean_prefix']
             else:
                 return item['patch_prefix']
-        elif self.dataset_name in [SupportedDatasets.CITIES, SupportedDatasets.COMPANIES, SupportedDatasets.FACTS]:
+        elif self.dataset_name.category == DatasetCategory.TRUE_FALSE:
             question = f"'{item['statement']}' - Is this statement True or False?'"
+            
+            prompt = (
+                f"{system_prompt} Now, here's the user's question:"
+                f'\n"{question}"'
+                f'\n{task_prompt}'
+            )
+            return prompt
         else:
-            raise ValueError(f"Dataset {self.dataset_name.value} not supported.")
+            raise ValueError(f"Dataset category {self.dataset_name.category} not supported.")
 
-        prompt = (
-            f"{system_prompt} Now, here's the user's question:"
-            f'\n"{question}"'
-            f'\n{task_prompt}'
-        )
-        return prompt
-    
+    # For the get_clean_answer method:
     def get_clean_answer(self, item, prompt, tokenize=True):
-        if self.dataset_name in [SupportedDatasets.COMMONSENSE_QA, SupportedDatasets.COMMONSENSE_QA_FILTERED]:
+        if self.dataset_name.category == DatasetCategory.QA:
             answer = item['answerKey']
-        elif self.dataset_name == SupportedDatasets.VERB_AGREEMENT:
+        elif self.dataset_name.category == DatasetCategory.AGREEMENT:
             answer = item['clean_answer']
-        elif self.dataset_name in [SupportedDatasets.CITIES, SupportedDatasets.COMPANIES, SupportedDatasets.FACTS]:
+        elif self.dataset_name.category == DatasetCategory.TRUE_FALSE:
             answer = str(item['label'])
         else:
-            raise ValueError(f"Dataset {self.dataset_name.value} not supported.")
+            raise ValueError(f"Dataset category {self.dataset_name.category} not supported.")
 
         try:
             # Find answer pos as the first token before padding in the prompt
@@ -299,17 +300,18 @@ class SFCDatasetLoader:
             answer = self.model.to_single_token(answer)
 
         return answer, answer_pos
-    
+
+    # For the get_corrupted_answer method:
     def get_corrupted_answer(self, item, prompt, tokenize=True):
-        if self.dataset_name in [SupportedDatasets.COMMONSENSE_QA, SupportedDatasets.COMMONSENSE_QA_FILTERED]:
+        if self.dataset_name.category == DatasetCategory.QA:
             correct_answer = item['answerKey']
             answer = [option for option in ['A', 'B', 'C', 'D', 'E'] if option != correct_answer]
-        elif self.dataset_name == SupportedDatasets.VERB_AGREEMENT:
+        elif self.dataset_name.category == DatasetCategory.AGREEMENT:
             answer = item['patch_answer']
-        elif self.dataset_name in [SupportedDatasets.CITIES, SupportedDatasets.COMPANIES, SupportedDatasets.FACTS]:
+        elif self.dataset_name.category == DatasetCategory.TRUE_FALSE:
             answer = str(not item['label'])
         else:
-            raise ValueError(f"Dataset {self.dataset_name.value} not supported.")
+            raise ValueError(f"Dataset category {self.dataset_name.category} not supported.")
 
         try:
             # Find answer pos as the first token before padding in the prompt

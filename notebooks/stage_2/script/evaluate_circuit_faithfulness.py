@@ -121,9 +121,9 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
 
-dataloader = SFCDatasetLoader(DATASET_NAME, model,
+dataloader = SFCDatasetLoader(DATASET_NAME, model, # num_samples=10000,
                               local_dataset=True, base_folder_path=datapath)
 
 
@@ -192,7 +192,7 @@ caching_device
 # - Loads a Gemma model and its Gemma Scope SAEs (either attaching them to the model or not)
 # - Provides interface methods to compute SFC scores (currently, only attr patching is supported) on an arbitrary dataset (that follows the format of my SFCDatasetLoader class from above)
 
-EXPERIMENT = 'sva_rc'
+EXPERIMENT = 'sva_rc_test'
 
 clear_cache()
 sfc_model = SFC_Gemma(model, params_count=PARAMS_COUNT, control_seq_len=CONTROL_SEQ_LEN, 
@@ -222,15 +222,15 @@ import numpy as np
 
 batch_size = 1024
 total_batches = None
-total_thresholds = 30
+total_thresholds = 15
 
 # Define threshold range (logarithmic scale) for SFC scores, which controls the number of nodes in the circuit
 # (only the nodes above the threshold are kept in the circuit)
 thresholds = np.concatenate([
     # A few samples below 0.0001
-    np.logspace(-6, -4, int(total_thresholds * 0.1), endpoint=False),
+    np.logspace(-6, -4, int(total_thresholds * 0.2), endpoint=False),
     # Dense sampling in the more interesting region of [0.0001, 0.01]
-    np.logspace(-4, -2, int(total_thresholds * 0.9)),
+    np.logspace(-4, -2, int(total_thresholds * 0.8)),
     # No samples above 0.01
 ])
 
@@ -253,7 +253,7 @@ from IPython.display import display
 results = []
 print("Evaluating standard circuit faithfulness...")
 
-for i, threshold in tqdm(enumerate(thresholds)):
+for i, threshold in enumerate(thresholds):
     print(f'Thresholds progress {i}/{len(thresholds)}')
 
     # Evaluate standard circuit (no special ablations)
@@ -300,7 +300,7 @@ results = []
 print("Evaluating standard circuit faithfulness with resid error nodes ablated...")
 
 # Use the same thresholds as above
-for i, threshold in tqdm(enumerate(thresholds)):
+for i, threshold in enumerate(thresholds):
     print(f'Thresholds progress {i}/{len(thresholds)}')
     
     # Evaluate circuit with error nodes always ablated
@@ -345,7 +345,7 @@ if RUN_WITH_SAES:
 
 results = []
 # Use the same thresholds as above
-for i, threshold in tqdm(enumerate(thresholds)):
+for i, threshold in enumerate(thresholds):
     print(f'Thresholds progress {i}/{len(thresholds)}')
 
     # Evaluate circuit with error nodes always ablated
@@ -460,7 +460,7 @@ datapath
 
 
 # Load the CSV files with our metrics
-EXPERIMENT = 'sva_rc'
+EXPERIMENT = 'sva_rc_test'
 
 standard_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval.csv")
 resid_errors_ablated_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval_resid_err_abl.csv")
