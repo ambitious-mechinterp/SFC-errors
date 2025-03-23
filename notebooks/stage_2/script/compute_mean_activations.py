@@ -162,7 +162,7 @@ assert (corrupted_dataset['answer_pos'] < N_CONTEXT).all().item(), "Answer posit
 
 from classes.sfc_model import SFC_Gemma
 
-RUN_WITH_SAES = True # we'll need to run the model with attached SAEs
+RUN_WITH_SAES = True # we'll need to run the model with attached SAEs to store the mean acts of SAE latents and errors
 
 # Determine the caching device, where we'll load our SAEs and compute the SFC scores
 if RUN_WITH_SAES:
@@ -191,329 +191,303 @@ clear_cache()
 # , sfc_model.saes[0].cfg.dtype
 
 
-# # Evaluation part
+# # Computing Mean Activations
 
-# Here we'll call use CircuitEvaluator class, which encapsulates the SFC circuit evaluation logic.
+# Here we'll call the corresponding method from the CircuitEvaluator class. This class encapsulates the SFC circuit evaluation algorithms.
 
 from classes.sfc_evaluator import CircuitEvaluator
 
-circuit_evaluator = CircuitEvaluator(sfc_model)
+evaluator = CircuitEvaluator(sfc_model)
 
-
-# ## Standard faithfulness eval
-
-# We'll reproduce the original Figure 3 from the SFC paper, starting from the standard case of using the full circuit.
-
-import numpy as np
 
 batch_size = 900
-total_batches = 1
-
-# Define threshold range (logarithmic scale) for SFC scores, which controls the number of nodes in the circuit
-# (only the nodes above the threshold are kept in the circuit)
-thresholds = np.concatenate([
-    # A few samples below 0.0001
-    np.logspace(-6, -4, 5, endpoint=False),
-    # Dense sampling in the more interesting region of [0.0001, 0.01]
-    np.logspace(-4, -2, 15),
-    # No samples above 0.01
-])
-
-# Print the thresholds to verify
-print("Threshold values:")
-for t in thresholds:
-    print(f"{t:.6f}")
-
-
-#  Now to the plotting part
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
-def plot_faithfulness_results(results_df):
-    """
-    Create plots similar to those in the SFC paper, with error bars.
-    
-    Args:
-        results_df: DataFrame with evaluation results including std_faithfulness
-    
-    Returns:
-        Plotly figure
-    """
-    # Create figure with secondary y-axis
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # Get unique circuit types
-    circuit_types = results_df['circuit_type'].unique()
-    
-    # Colors for different circuit types
-    colors = {
-        'standard': 'blue',
-        'errors_ablated': 'red'
-    }
-    
-    # Add traces for each circuit type
-    for circuit_type in circuit_types:
-        df_subset = results_df[results_df['circuit_type'] == circuit_type]
-        
-        # Sort by number of nodes for proper line plotting
-        df_subset = df_subset.sort_values('n_nodes')
-        
-        # Add faithfulness trace with error bars
-        fig.add_trace(
-            go.Scatter(
-                x=df_subset['n_nodes'],
-                y=df_subset['faithfulness'],
-                mode='lines+markers',
-                name=f'Faithfulness ({circuit_type})',
-                line=dict(color=colors.get(circuit_type, 'gray')),
-                error_y=dict(
-                    type='data',
-                    array=df_subset['std_faithfulness'],
-                    visible=True,
-                    color=colors.get(circuit_type, 'gray'),
-                    thickness=1,
-                    width=3
-                ),
-                hovertemplate='Nodes: %{x}<br>Faithfulness: %{y:.3f}±%{error_y.array:.3f}'
-            ),
-            secondary_y=False
-        )
-    
-    # Update layout
-    fig.update_layout(
-        title="Circuit Faithfulness vs. Number of Nodes" + f' ({circuit_type})',
-        xaxis_title="Number of Nodes in Circuit",
-        yaxis_title="Faithfulness",
-        legend_title="Circuit Type",
-        template="plotly_white",
-        width=900,
-        height=600,
-        hovermode="closest"
-    )
-    
-    # Add horizontal line at faithfulness = 0.5
-    fig.add_shape(
-        type="line",
-        x0=0,
-        y0=0.5,
-        x1=max(results_df['n_nodes']) * 1.1,
-        y1=0.5,
-        line=dict(
-            color="gray",
-            width=1,
-            dash="dash",
-        ),
-        secondary_y=False
-    )
-    
-    return fig
-
+total_batches = None
 
 # Reset the hooks to avoid weird bugs
 sfc_model.model.reset_hooks()
 if RUN_WITH_SAES:
     sfc_model._reset_sae_hooks()
 
+# Below we'll call the main interface method for computing the mean scores
+mean_scores = evaluator.compute_mean_node_activations(clean_dataset, corrupted_dataset, 
+                                                      batch_size=batch_size, total_batches=total_batches)
+mean_scores.keys()
 
-from tqdm.notebook import tqdm
+
+# Total amount of scores should be n_layers * len(['resid', 'mlp', 'attn']) * len(['sae_latent', 'sae_error'])
+assert len(mean_scores) == sfc_model.model.cfg.n_layers * 3 * 2
+
+
+# Shapes check
+mean_scores['blocks.0.attn.hook_z.hook_sae_error'].shape, mean_scores['blocks.0.attn.hook_z.hook_sae_acts_post'].shape, \
+mean_scores['blocks.0.hook_mlp_out.hook_sae_error'].shape, mean_scores['blocks.0.hook_mlp_out.hook_sae_acts_post'].shape, \
+mean_scores['blocks.0.hook_resid_post.hook_sae_error'].shape, mean_scores['blocks.0.hook_resid_post.hook_sae_acts_post'].shape
+
+# Only the first attn error should have a different shape (accounting for each head) - [pos, n_head, d_head]
+# All other errors should be [pos, d_model]
+# All latents (hook_sae_acts_post) should be [pos, d_sae]
+
+
+# # Results check
+
+# #### Setup x2 for running the notebook from this section (don't read)
+
+from IPython import get_ipython # type: ignore
+ipython = get_ipython(); assert ipython is not None
+ipython.run_line_magic("load_ext", "autoreload")
+ipython.run_line_magic("autoreload", "2")
+
+# Standard imports
+import os
+import torch
+import numpy as np
+from tqdm import tqdm
+import plotly.express as px
 import pandas as pd
-from IPython.display import display
+import einops
+from jaxtyping import Float, Int
+from torch import Tensor
 
-results = []
-print("Evaluating standard circuit faithfulness...")
+torch.set_grad_enabled(False)
 
-for threshold in tqdm(thresholds):
-    # Evaluate standard circuit (no special ablations)
-    faithfulness, n_nodes = circuit_evaluator.evaluate_circuit_faithfulness(
-        clean_dataset, 
-        corrupted_dataset, 
-        node_threshold=threshold,
-        batch_size=batch_size,
-        total_batches=total_batches
-    )
-    
-    # Calculate average faithfulness and standard deviation
-    avg_faithfulness = faithfulness.mean().item()
-    std_faithfulness = faithfulness.std().item()
-    
-    results.append({
-        'threshold': threshold,
-        'n_nodes': n_nodes,
-        'faithfulness': avg_faithfulness,
-        'std_faithfulness': std_faithfulness,
-        'circuit_type': 'standard'
-    })
+# Device setup
+GPU_TO_USE = 3
 
-results_df = pd.DataFrame(results)
-display(results_df)
+if torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = f"cuda:{GPU_TO_USE}" if torch.cuda.is_available() else "cpu"
 
+print(f"Device: {device}")
 
+# utility to clear variables out of the memory & and clearing cuda cache
+import gc
+def clear_cache():
+    gc.collect()
+    torch.cuda.empty_cache()
 
+from pathlib import Path
+import sys
+import os
 
+def get_base_folder(parent_dir_name =  "tim-taras-sfc-errors"):
+	# Find the project root dynamically
+	current_dir = os.getcwd()
+	while True:
+		if os.path.basename(current_dir) == parent_dir_name:  # Adjust to match your project root folder name
+			break
+		parent = os.path.dirname(current_dir)
+		if parent == current_dir:  # Stop if we reach the system root (failsafe)
+			raise RuntimeError(f"Project root {parent_dir_name} not found. Check your folder structure.")
+		current_dir = parent
 
-# ## Faithfulness eval when resid error nodes are ablated
+	return current_dir
 
-always_ablate_fn = lambda name: 'hook_resid_post.hook_sae_error' in name
+def get_data_path(base_folder=None, data_folder_name='data'):
+	if base_folder is None:
+		base_folder = get_base_folder()
 
+	return Path(base_folder) / data_folder_name
 
-results = []
-# Use the same thresholds as above
-for threshold in tqdm(thresholds):        
-    # Evaluate circuit with error nodes always ablated
-    faithfulness, n_nodes = circuit_evaluator.evaluate_circuit_faithfulness(
-        clean_dataset, 
-        corrupted_dataset, 
-        node_threshold=threshold,
-        always_ablate_fn=always_ablate_fn,
-        batch_size=batch_size,
-        total_batches=total_batches
-    )
-    
-    # Calculate average faithfulness and standard deviation
-    avg_faithfulness = faithfulness.mean().item()
-    std_faithfulness = faithfulness.std().item()
-    
-    results.append({
-        'threshold': threshold,
-        'n_nodes': n_nodes,
-        'faithfulness': avg_faithfulness,
-        'std_faithfulness': std_faithfulness,
-        'circuit_type': 'resid_errors_ablated'
-    })
-    
-# Convert results to DataFrame
-resid_errors_ablated_results_df = pd.DataFrame(results)
+def get_project_folder(base_folder=None, project_folder_name='sfc-errors'):
+	if base_folder is None:
+		base_folder = get_base_folder()
+	
+	return Path(base_folder) / project_folder_name
+
+base_path = get_base_folder()
+print(f"Base path: {base_path}")
+
+project_path = get_project_folder(base_folder=base_path)
+print(f"Project path: {project_path}")
+
+# Add the parent directory (sfc_deception) to sys.path
+sys.path.append(base_path)
+sys.path.append(str(project_path))
+
+datapath = get_data_path(base_path) 
+datapath
 
 
-fig = plot_faithfulness_results(resid_errors_ablated_results_df)
-fig.show()
+# Load all of our computed SFC scores and caches:
+
+from classes.sfc_node_scores import SFC_NodeScores
+EXPERIMENT = 'sva_rc'
+
+sfc_scores = SFC_NodeScores(
+    device=device,
+    data_dir=datapath,
+    experiment_name=EXPERIMENT,
+    load_if_exists=True  # This will automatically load our computed scores
+)
+
+sfc_scores.node_scores['blocks.0.attn.hook_z.hook_sae_error'].device #  checking if device mapping works (it does) 
 
 
-# ## Faithfulness eval when non-resid error nodes are ablated
+# ### Checking error norms
 
-always_ablate_fn = lambda name: 'hook_mlp_out.hook_sae_error' in name or 'hook_z.hook_sae_error' in name
+# One simple thing to check is whether resid error norms increase monotonically with the layer number. Based on the results of `stage_1/analyze_error_scores.ipynb` - they should, so let's see if this holds for mean error activations.
 
-
-results = []
-# Use the same thresholds as above
-for threshold in tqdm(thresholds):        
-    # Evaluate circuit with error nodes always ablated
-    faithfulness, n_nodes = circuit_evaluator.evaluate_circuit_faithfulness(
-        clean_dataset, 
-        corrupted_dataset, 
-        node_threshold=threshold,
-        always_ablate_fn=always_ablate_fn,
-        batch_size=batch_size,
-        total_batches=total_batches
-    )
-    
-    # Calculate average faithfulness and standard deviation
-    avg_faithfulness = faithfulness.mean().item()
-    std_faithfulness = faithfulness.std().item()
-    
-    results.append({
-        'threshold': threshold,
-        'n_nodes': n_nodes,
-        'faithfulness': avg_faithfulness,
-        'std_faithfulness': std_faithfulness,
-        'circuit_type': 'errors_ablated'
-    })
-    
-# Convert results to DataFrame
-errors_ablated_results_df = pd.DataFrame(results)
+resid_error_mean_act = sfc_scores.select_node_scores(lambda x: 'hook_resid_post.hook_sae_error' in x, 'mean_act')
+print(f'Returned {len(resid_error_mean_act.keys())} keys: {resid_error_mean_act.keys()}')
 
 
-fig = plot_faithfulness_results(errors_ablated_results_df)
-fig.show()
+resid_error_mean_act['blocks.0.hook_resid_post.hook_sae_error'].shape
 
 
-# # Utility plots
+# Compute norms of mean error activations
+resid_error_mean_norms = {key: score_tensor.norm(dim=-1) for key, score_tensor in resid_error_mean_act.items()}
+resid_error_mean_norms['blocks.0.hook_resid_post.hook_sae_error'].shape
 
-def plot_threshold_vs_nodes(results_df):
+
+def plot_mean_norms(mean_norms, positions_to_plot=[-2], title='Norms of mean SAE errors'):
     """
-    Plot threshold vs number of nodes to help with threshold selection.
+    Plots the mean norms of SAE errors for each layer using Plotly.
     
     Args:
-        results_df: DataFrame with evaluation results
-    
+        mean_norms (dict): Dictionary with keys like 'blocks.{j}.hook_resid_post.hook_sae_error' 
+                          and values as tensors of shape [num_positions]
+        positions_to_plot (list): List of positions to plot (indices into the first dimension), 
+                                 default is [-2] (second to last)
+        title (str): Title for the plot
+        
     Returns:
-        Plotly figure 
+        plotly.graph_objects.Figure: The plotly figure object
     """
-    # Create figure with secondary y-axis
-    fig = make_subplots()
+    import plotly.graph_objects as go
+    import re
     
-    # Get unique circuit types
-    circuit_types = results_df['circuit_type'].unique()
+    # Get the number of positions from the first tensor's shape
+    first_key = next(iter(mean_norms))
+    num_positions = mean_norms[first_key].shape[0]
     
-    # Colors for different circuit types
-    colors = {
-        'standard': 'blue',
-        'errors_ablated': 'red'
-    }
+    # Ensure positions_to_plot is a list
+    if not isinstance(positions_to_plot, list):
+        positions_to_plot = [positions_to_plot]
     
-    # Add traces for each circuit type
-    for circuit_type in circuit_types:
-        df_subset = results_df[results_df['circuit_type'] == circuit_type]
+    # Create the plot
+    fig = go.Figure()
+    
+    for position in positions_to_plot:
+        # Convert negative position index to positive if needed
+        pos = position if position >= 0 else num_positions + position
         
-        # Sort by threshold for proper line plotting
-        df_subset = df_subset.sort_values('threshold')
+        # Extract layer indices and corresponding norm values for the specified position
+        layer_indices = []
+        norm_values = []
         
-        # Add nodes trace
+        for key, norm_tensor in mean_norms.items():
+            # Use regex to extract the layer number from keys like 'blocks.{j}.hook_resid_post.hook_sae_error'
+            match = re.search(r'blocks\.(\d+)\.', key)
+            if match:
+                layer_idx = int(match.group(1))
+                # Get the norm value for the specified position
+                norm_value = float(norm_tensor[pos].item())
+                
+                layer_indices.append(layer_idx)
+                norm_values.append(norm_value)
+        
+        # Sort by layer index to ensure correct ordering
+        sorted_data = sorted(zip(layer_indices, norm_values))
+        sorted_layer_indices, sorted_norm_values = zip(*sorted_data) if sorted_data else ([], [])
+        
+        # Add a trace for this position
         fig.add_trace(
             go.Scatter(
-                x=df_subset['threshold'],
-                y=df_subset['n_nodes'],
+                x=sorted_layer_indices,
+                y=sorted_norm_values,
                 mode='lines+markers',
-                name=f'Nodes ({circuit_type})',
-                line=dict(color=colors.get(circuit_type, 'gray')),
-                hovertemplate='Threshold: %{x:.4f}<br>Nodes: %{y}'
+                name=f'Position {position}'
             )
         )
     
-    # Update layout
+    # Set plot title and labels
     fig.update_layout(
-        title="Number of Nodes vs. Threshold",
-        xaxis_title="Threshold",
-        yaxis_title="Number of Nodes in Circuit",
-        legend_title="Circuit Type",
-        template="plotly_white",
-        width=900,
-        height=600,
-        hovermode="closest",
-        xaxis=dict(type="log")  # Log scale for threshold
+        title=title,
+        xaxis_title='Layer',
+        yaxis_title='Norm Value',
+        xaxis=dict(tickmode='linear'),
+        template='plotly_white',
+        legend_title="Position"
     )
     
     return fig
 
-fig2 = plot_threshold_vs_nodes(results_df)
-fig2.show()
+
+# Plot multiple positions
+fig = plot_mean_norms(resid_error_mean_norms, positions_to_plot=[2, 3, -2])
+fig.show()
 
 
-# Define a range of thresholds to test
-test_thresholds = thresholds
+# So the result is overall expected, but one interesting observation is that the norm of the mean errors seems to be the highest for error nodes at position #3 ('that' token in SVA dataset) where we don't see important error nodes at all in the late layers.
+# 
+# Also note that "norm of mean errors" (plotted above) is not the same as "mean of error norms". Intuitively the "norm of mean errors" should be dominated by the "mean of error norms" because of the fact that "mean error" is a center of mass of a bunch of vectors. So e.g. when you have a lot of high-norm vectors which are kind of all in different directions, their center of mass would be somewhere in between around 0, making its norm much smaller than norms of individual vectors. 
 
-# Run monotonicity check
-is_monotonic, node_counts, inclusion_checks = circuit_evaluator.debug_circuit_monotonicity(
-    test_thresholds, verbose=True)
+# For curious readers, here's the (Claude-generated but looking correct) proof
 
-# Analyze circuit composition
-composition_df = circuit_evaluator.analyze_circuit_composition(test_thresholds)
-display(composition_df)
-
-# Plot node counts to visualize monotonicity
-import matplotlib.pyplot as plt
-plt.figure(figsize=(10, 6))
-thresholds = list(node_counts.keys())
-counts = list(node_counts.values())
-plt.plot(thresholds, counts, 'o-')
-plt.xscale('log')
-plt.xlabel('Threshold')
-plt.ylabel('Number of Nodes in Circuit')
-plt.title('Circuit Size vs Threshold')
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
-
+# $$
+# \text{For any set of vectors } \{\vec{e}_i\}_{i=1}^n \text{ in a Euclidean space, the following inequality holds:}
+# $$
+# 
+# $$
+# \left\|\frac{1}{n}\sum_{i=1}^n \vec{e}_i\right\| \leq \frac{1}{n}\sum_{i=1}^n \|\vec{e}_i\|
+# $$
+# 
+# $$
+# \text{Let } \vec{\mu} = \frac{1}{n}\sum_{i=1}^n \vec{e}_i \text{ be the mean of the error vectors.}
+# $$
+# 
+# $$
+# \text{The Euclidean norm } \|\cdot\| \text{ is a convex function due to the triangle inequality and the properties}
+# $$
+# $$
+# \text{of square root. By Jensen's inequality, for a convex function } f \text{ and a random variable } X\text{:}
+# $$
+# 
+# $$
+# f(\mathbb{E}[X]) \leq \mathbb{E}[f(X)]
+# $$
+# 
+# $$
+# \text{Applying this to our vectors with } f = \|\cdot\| \text{ and treating the vectors as random variables with}
+# $$
+# $$
+# \text{uniform probability } \frac{1}{n}\text{:}
+# $$
+# 
+# $$
+# \|\mathbb{E}[\vec{e}]\| \leq \mathbb{E}[\|\vec{e}\|]
+# $$
+# 
+# $$
+# \text{Which gives us:}
+# $$
+# 
+# $$
+# \left\|\frac{1}{n}\sum_{i=1}^n \vec{e}_i\right\| \leq \frac{1}{n}\sum_{i=1}^n \|\vec{e}_i\|
+# $$
+# 
+# $$
+# \text{Equality Condition: The equality holds if and only if all vectors } \vec{e}_i \text{ are collinear with}
+# $$
+# $$
+# \text{the same orientation, i.e., } \vec{e}_i = c_i\vec{v} \text{ for some unit vector } \vec{v} \text{ and } c_i \geq 0 \text{ (or } c_i \leq 0 \text{ for all } i\text{).}
+# $$
+# 
+# $$
+# \text{For example, if } \vec{e}_i = b_i \cdot \vec{\alpha} \text{ where } \|\vec{\alpha}\| = 1 \text{ and all } b_i \text{ have the same sign:}
+# $$
+# 
+# $$
+# \begin{align}
+# \|\mathbb{E}[\vec{e}]\| &= \|\mathbb{E}[b_i \cdot \vec{\alpha}]\| = \|\mathbb{E}[b_i] \cdot \vec{\alpha}\| = |\mathbb{E}[b_i]| \cdot \|\vec{\alpha}\| = \mathbb{E}[b_i] \\
+# \mathbb{E}[\|\vec{e}\|] &= \mathbb{E}[\|b_i \cdot \vec{\alpha}\|] = \mathbb{E}[|b_i| \cdot \|\vec{\alpha}\|] = \mathbb{E}[|b_i|] = \mathbb{E}[b_i]
+# \end{align}
+# $$
+# 
+# $$
+# \text{Therefore, } \|\mathbb{E}[\vec{e}]\| = \mathbb{E}[\|\vec{e}\|] \text{ in this special case.}
+# $$
 
 
 

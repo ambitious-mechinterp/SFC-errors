@@ -192,6 +192,171 @@ class SFC_NodeScores:
             
         selected_node_scores = {key: score for key, score in scores_dict.items() if selection_fn(key)}
         return selected_node_scores
+
+    def get_top_k_features_by_layer(self, layers_to_extract, top_k_counts=None, 
+                                abs_scores=True, aggregation_type='sum',
+                                positions_to_select=None,
+                                include_components=None, verbose=True):
+        """
+        Extract the top-k SAE features from specified layers based on their importance scores.
+        Returns feature indices for use with evaluate_circuit_faithfulness().
+        
+        Shape Suffix Definition:
+        - P: Number of token positions
+        - F: Number of SAE features (d_sae)
+        - K: Number of top features to extract (k)
+        - S: Number of selected positions (when positions_to_select is used)
+        
+        Args:
+            layers_to_extract: List of layer indices to extract features from, e.g. [17, 18]
+            top_k_counts: List of counts specifying how many top features to extract from each layer.
+                        Should match the length of layers_to_extract.
+                        If a single integer is provided, it will be used for all specified layers.
+                        If None, defaults to 10 for each layer.
+            abs_scores: Whether to use absolute values of scores when ranking features.
+                    Default is True to select features with the strongest effects regardless of direction.
+            aggregation_type: Method to aggregate scores across positions ('sum' or 'max').
+                            Only used if positions_to_select is None.
+            positions_to_select: Optional list of specific token positions to consider for feature selection.
+                                If provided, features are selected based on their scores at these positions only.
+            include_components: List of component names to include (e.g., ["hook_resid_post", "attn.hook_z", "hook_mlp_out"])
+                            If None, includes all components.
+            verbose: Whether to print details about the extracted features.
+        
+        Returns:
+            Tuple containing:
+            1. Dictionary mapping node names to lists of feature indices to restore
+            {
+                "blocks.17.hook_resid_post.hook_sae_acts_post": [42, 123, 456, ...],
+                "blocks.17.attn.hook_z.hook_sae_acts_post": [789, 101, 202, ...],
+                ...
+            }
+            2. Dictionary mapping node names to maximizing positions for each feature
+            {
+                "blocks.17.hook_resid_post.hook_sae_acts_post": tensor([6, 2, 6, ...]),
+                ...
+            }
+        """
+        if self.node_scores is None:
+            raise ValueError("Node scores have not been initialized. Compute SFC scores first.")
+        
+        # Step 1: Standardize top_k_counts to match the number of layers
+        if top_k_counts is None:
+            top_k_counts = [10] * len(layers_to_extract)
+        elif isinstance(top_k_counts, int):
+            top_k_counts = [top_k_counts] * len(layers_to_extract)
+        
+        if len(layers_to_extract) != len(top_k_counts):
+            raise ValueError("layers_to_extract and top_k_counts must have the same length")
+        
+        # Check aggregation_type is valid
+        if aggregation_type not in ['sum', 'max']:
+            raise ValueError("aggregation_type must be 'sum' or 'max'")
+        
+        # Dictionary to store results - maps full node names to feature indices to restore
+        feature_indices_to_restore = {}
+        
+        # Dictionary to store maximizing positions for each selected feature
+        maximizing_positions = {}
+        
+        # Step 2: Process each layer
+        for layer_idx, layer_num in enumerate(layers_to_extract):
+            k = top_k_counts[layer_idx]
+            
+            # Get all feature nodes for this layer
+            layer_features = {}
+            layer_max_positions = {}
+            
+            for key, scores_PF in self.node_scores.items():
+                # Check if this is a feature node (not an error node) from the specified layer
+                if "hook_sae_acts_post" in key and f"blocks.{layer_num}." in key:
+                    # Extract component name (e.g., "hook_resid_post" or "attn.hook_z")
+                    component_name = key.split(f"blocks.{layer_num}.")[1].split(f".hook_sae_acts_post")[0]
+                    
+                    # Skip if not in included components
+                    if include_components is not None and component_name not in include_components:
+                        continue
+                    
+                    # Feature nodes have shape [positions, d_sae]
+                    if scores_PF.dim() > 1:
+                        # Apply abs if requested (do this first so max/sum operates on absolute values if needed)
+                        if abs_scores:
+                            scores_to_use = scores_PF.abs()
+                        else:
+                            scores_to_use = scores_PF
+                        
+                        # Step 3: Process scores based on positions_to_select or aggregation_type
+                        if positions_to_select is not None:
+                            # Select only specific positions
+                            # Convert positions to tensor and ensure it's on the same device as scores
+                            pos_tensor = torch.tensor(positions_to_select, 
+                                                    device=scores_to_use.device)
+                            
+                            # Select only those positions from scores
+                            # Shape: [S, d_sae]
+                            selected_scores = scores_to_use[pos_tensor]
+                            
+                            # Get max value and position index across selected positions
+                            feature_scores_F, max_pos_indices = selected_scores.max(dim=0)
+                            # max_pos_indices has shape [d_sae] and contains indices into pos_tensor
+                            
+                            # Calculate the actual positions that maximize each feature
+                            # This maps the indices back to the original positions in positions_to_select
+                            maximizing_tok_positions = pos_tensor[max_pos_indices]
+                            
+                            # Store maximizing positions
+                            layer_max_positions[key] = maximizing_tok_positions
+                        else:
+                            # Use standard aggregation method
+                            if aggregation_type == 'sum':
+                                feature_scores_F = scores_to_use.sum(dim=0)  # Shape: [d_sae]
+                                
+                                # For maximizing positions, use argmax even when sum aggregation is used
+                                maximizing_tok_positions = scores_to_use.argmax(dim=0)
+                            else:  # aggregation_type == 'max'
+                                feature_scores_F, maximizing_tok_positions = scores_to_use.max(dim=0)
+                            
+                            # Store maximizing positions
+                            layer_max_positions[key] = maximizing_tok_positions
+                        
+                        # Store this node's features with their scores
+                        layer_features[key] = feature_scores_F
+            
+            # Step 4: Find top-k features for each component in this layer
+            for node_name, feature_scores_F in layer_features.items():
+                # Get indices of top-k features by score
+                actual_k = min(k, len(feature_scores_F))
+                topk_result = torch.topk(feature_scores_F, actual_k, largest=True)
+                top_k_scores_K = topk_result.values  # Shape: [k]
+                top_k_indices_K = topk_result.indices  # Shape: [k]
+                
+                # Store the indices
+                feature_indices_to_restore[node_name] = top_k_indices_K.tolist()
+                
+                # Store the maximizing positions for selected features
+                maximizing_positions[node_name] = layer_max_positions[node_name][top_k_indices_K]
+                
+                # Step 5: Report results if verbose
+                if verbose:
+                    component_name = node_name.split('.')[-3]
+                    print(f"Layer {layer_num}, {component_name}: {len(top_k_indices_K)} features selected")
+                    
+                    if len(top_k_indices_K) > 0:
+                        max_score = top_k_scores_K[0].item()
+                        min_score = top_k_scores_K[-1].item()
+                        print(f"  Score range: {min_score:.4f} to {max_score:.4f}")
+                        
+                        # Report maximizing positions for sample features
+                        if positions_to_select is not None:
+                            pos_sample = max(3, min(5, len(top_k_indices_K)))
+                            max_pos = maximizing_positions[node_name][:pos_sample]
+                            indices_sample = top_k_indices_K[:pos_sample].tolist()
+                            
+                            print(f"  Sample maximizing positions:")
+                            for i in range(pos_sample):
+                                print(f"    Feature {indices_sample[i]}: position {max_pos[i].item()}")
+        
+        return feature_indices_to_restore, maximizing_positions
     
     def save_scores(self, mode="all"):
         """

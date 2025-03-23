@@ -711,37 +711,6 @@ class SFC_Gemma():
 
         return sae_acts_post, sae_error
     
-    def _sae_act_name_to_hook_name(self, sae_act_name):
-        """
-        Convert a SAE activation name (hook_sae_acts_post or hook_sae_error) back to the original hook name.
-        This is the inverse of hook_name_to_sae_act_name.
-        """
-        # Split the input string by periods
-        parts = sae_act_name.split('.')
-        
-        # Validate the input format
-        if len(parts) < 3 or parts[0] != 'blocks':
-            raise ValueError("Input string must start with 'blocks.<index>.'")
-            
-        # Extract the index and hook_name without the SAE suffix
-        index = parts[1]
-        hook_name_parts = []
-        
-        # Extract the hook name parts before ".hook_sae_acts_post" or ".hook_sae_error"
-        for part in parts[2:]:
-            if 'hook_sae_acts_post' in part:
-                hook_name_parts.append(part.split('.hook_sae_acts_post')[0])
-                break
-            elif 'hook_sae_error' in part:
-                hook_name_parts.append(part.split('.hook_sae_error')[0])
-                break
-            else:
-                hook_name_parts.append(part)
-        
-        # Construct the original hook name
-        original_hook_name = f"blocks.{index}.{'.'.join(hook_name_parts)}"
-        return original_hook_name
-    
     def hook_name_to_layer_number(self, hook_name):
         # Split the input string by periods
         parts = hook_name.split('.')

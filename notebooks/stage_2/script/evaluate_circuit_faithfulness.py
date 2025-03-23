@@ -123,7 +123,7 @@ from utils.enums import *
 
 DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
 
-dataloader = SFCDatasetLoader(DATASET_NAME, model, # num_samples=10000,
+dataloader = SFCDatasetLoader(DATASET_NAME, model, num_samples=10000,
                               local_dataset=True, base_folder_path=datapath)
 
 
@@ -221,16 +221,16 @@ circuit_evaluator = CircuitEvaluator(sfc_model)
 import numpy as np
 
 batch_size = 1024
-total_batches = None
-total_thresholds = 15
+total_batches = 1
+total_thresholds = 20
 
 # Define threshold range (logarithmic scale) for SFC scores, which controls the number of nodes in the circuit
 # (only the nodes above the threshold are kept in the circuit)
 thresholds = np.concatenate([
-    # A few samples below 0.0001
-    np.logspace(-6, -4, int(total_thresholds * 0.2), endpoint=False),
-    # Dense sampling in the more interesting region of [0.0001, 0.01]
-    np.logspace(-4, -2, int(total_thresholds * 0.8)),
+    # A few samples below 0.00001
+    np.logspace(-6, -5, int(total_thresholds * 0.2), endpoint=False),
+    # Dense sampling in the more interesting region of [0.00001, 0.01]
+    np.logspace(-5, -2, int(total_thresholds * 0.8)),
     # No samples above 0.01
 ])
 
@@ -244,6 +244,7 @@ for t in thresholds:
 sfc_model.model.reset_hooks()
 if RUN_WITH_SAES:
     sfc_model._reset_sae_hooks()
+clear_cache()
 
 
 from tqdm.notebook import tqdm
@@ -262,7 +263,8 @@ for i, threshold in enumerate(thresholds):
         corrupted_dataset, 
         node_threshold=threshold,
         batch_size=batch_size,
-        total_batches=total_batches
+        total_batches=total_batches,
+        verbose = i == 0 # log only for the first batch
     )
     
     # Calculate average faithfulness and standard deviation
@@ -308,9 +310,10 @@ for i, threshold in enumerate(thresholds):
         clean_dataset, 
         corrupted_dataset, 
         node_threshold=threshold,
-        always_ablate_fn=always_ablate_fn,
+        nodes_to_always_ablate=always_ablate_fn,
         batch_size=batch_size,
-        total_batches=total_batches
+        total_batches=total_batches,
+        verbose = i == 0 # log only for the first batch
     )
     
     # Calculate average faithfulness and standard deviation
@@ -341,6 +344,7 @@ always_ablate_fn = lambda name: 'hook_mlp_out.hook_sae_error' in name or 'hook_z
 sfc_model.model.reset_hooks()
 if RUN_WITH_SAES:
     sfc_model._reset_sae_hooks()
+clear_cache()
 
 
 results = []
@@ -353,9 +357,10 @@ for i, threshold in enumerate(thresholds):
         clean_dataset, 
         corrupted_dataset, 
         node_threshold=threshold,
-        always_ablate_fn=always_ablate_fn,
+        nodes_to_always_ablate=always_ablate_fn,
         batch_size=batch_size,
-        total_batches=total_batches
+        total_batches=total_batches,
+        verbose = i == 0 # log only for the first batch
     )
     
     # Calculate average faithfulness and standard deviation
@@ -375,7 +380,17 @@ errors_ablated_results_df = pd.DataFrame(results)
 print(errors_ablated_results_df)
 
 
+save_dir = datapath / EXPERIMENT
+
 errors_ablated_results_df.to_csv(save_dir / "faithfulness_eval_mlpattn_err_abl.csv", index=False)
+
+
+# Define a range of thresholds to test
+test_thresholds = results_df['threshold'].unique()
+
+# Analyze circuit composition
+composition_df = circuit_evaluator.analyze_circuit_composition(test_thresholds)
+display(composition_df)
 
 
 # # Results analysis
@@ -642,14 +657,6 @@ plot_multiple_faithfulness_results(
     [standard_results_df, resid_errors_ablated_results_df, errors_ablated_results_df], 
     title="Comparison of Circuit Faithfulness Across Configurations"
 ).show()
-
-
-# Define a range of thresholds to test
-test_thresholds = standard_results_df['threshold'].unique()
-
-# Analyze circuit composition
-composition_df = circuit_evaluator.analyze_circuit_composition(test_thresholds)
-display(composition_df)
 
 
 

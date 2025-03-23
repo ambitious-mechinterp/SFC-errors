@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple, Union, Callable, Optional, Any
 from jaxtyping import Float, Int
 from torch import Tensor
 import einops
+import inspect
 
 # Import SFC_NodeScores
 from .sfc_node_scores import SFC_NodeScores
@@ -176,34 +177,54 @@ class CircuitEvaluator:
                 
         return nodes_ablation_mask
     
-    def evaluate_circuit_faithfulness(self, clean_dataset, patched_dataset, node_threshold: float, 
-                                      always_ablate_fn=lambda act_name: False,
+    def evaluate_circuit_faithfulness(self, clean_dataset, patched_dataset, node_threshold=None, 
+                                      nodes_to_always_ablate=None, nodes_to_restore=None,
+                                      always_ablate_positions=None,
+                                      feature_indices_to_restore=None,
                                       cutoff_early_layers=True,
-                                      nodes_to_restore: Optional[List[str]] = None,
-                                      correct_for_the_nodes_to_restore: bool = False,
+                                      correct_for_the_nodes_to_restore=False,
                                       batch_size=100, total_batches=None,
                                       verbose=True) -> Tuple[torch.Tensor, int]:
         """
-        Evaluate the faithfulness of a circuit defined by nodes above threshold.
+        Evaluate the faithfulness of a circuit by selectively ablating and restoring nodes.
         
         Args:
             clean_dataset: The clean dataset to evaluate on
             patched_dataset: The patched dataset to evaluate on
-            node_threshold: Threshold to determine circuit nodes
-            always_ablate_fn: Function that determines which nodes should always be ablated
-                              regardless of threshold. Defaults to a function that returns False (no nodes are always ablated).
-            nodes_to_restore: List of node names to restore activation for (i.e. substitute their values as they would be without ablation)
-                Defaults to an empty list
+            node_threshold: Threshold to determine circuit nodes. 
+                            If None, operates entirely based on nodes_to_always_ablate and nodes_to_restore
+
+            nodes_to_always_ablate: a List containing the names of the nodes to unconditionally ablate,
+                                    or a Callable that maps node names to True/False indicating which nodes to ablate
+            always_ablate_positions: an optional List/array/tensor of positions at which we ablate the nodes from `nodes_to_always_ablate`
+                                     If not given, all positions are ablated by default.
+
+            nodes_to_restore: List of node names to restore activation for
+            feature_indices_to_restore: Dictionary mapping node names to lists of feature indices to restore.
+                                        Only applies to SAE feature nodes (hook_sae_acts_post).
+                                        If provided for a node, only the specified indices will be restored.
+
+            cutoff_early_layers: Whether to exclude early layers (first 1/3 of the model) from ablation
             correct_for_the_nodes_to_restore: Whether to correct the number of nodes in the circuit for the nodes to restore
-                Defaults to False (for easier comparison between runs)
+
             batch_size: Number of examples to process at once
             total_batches: Total number of batches to process
             verbose: Whether to print progress information
             
         Returns:
-            - Faithfulness metrics tensor of shape [total_batches * 2] for each batch (and clean & patched dataset),
+            - Faithfulness metrics tensor of shape [total_batches * 2] (2 multiplier comes from the use of both clean & patched dataset),
             - Total number of nodes in the circuit
         """
+        # Check if we have the mean activations pre-computed
+        if self.sfc_node_scores.mean_activations is None:
+            raise ValueError("Mean activations not computed. Compute mean activations first.")
+        
+        if self.sfc_node_scores.node_scores is None:
+            raise ValueError("SFC scores not computed. Compute SFC scores first.")
+
+        if set(self.sfc_node_scores.mean_activations.keys()) != set(self.sfc_node_scores.node_scores.keys()):
+            raise ValueError("Mean activations and SFC scores keys do not match.")
+
         # Count total batches and prompts to process
         n_prompts, seq_len = clean_dataset['prompt'].shape
         assert n_prompts == clean_dataset['answer'].shape[0] == patched_dataset['answer'].shape[0]
@@ -215,19 +236,92 @@ class CircuitEvaluator:
             if n_prompts % batch_size != 0:
                 total_batches += 1
         
-        nodes_ablation_mask = self.determine_nodes_to_ablate(node_threshold)
+        # Initialize the ablation masks dictionary, mapping node names to their ablation masks
+        ablation_masks = {}     
 
-        # Check if we have the mean activations pre-computed
-        if self.sfc_node_scores.mean_activations is None:
-            raise ValueError("Mean activations not computed. Compute mean activations first.")
+        # Step 1: populate it with full masks for the nodes_to_always_ablate:
+        if nodes_to_always_ablate is not None:
+            if inspect.isfunction(nodes_to_always_ablate):
+                always_ablate_condition = nodes_to_always_ablate
+            elif isinstance(nodes_to_always_ablate, list):
+                always_ablate_condition = lambda node_name: node_name in nodes_to_always_ablate
+            else:
+                raise ValueError("nodes_to_always_ablate argument should be either a function or a list of node names")
+            
+            # Populate binary masks for nodes in nodes_to_always_ablate with True values, indicating ablation at all positions
+            for node_name, sfc_scores in self.sfc_node_scores.node_scores.items():
+                if always_ablate_condition(node_name):
+                    ablation_masks[node_name] = torch.ones_like(sfc_scores, dtype=torch.bool, device=self.device)
 
+                    if always_ablate_positions is not None:
+                        # Use only specific ablation position if provided
+                        ablation_masks[node_name][always_ablate_positions, ...] = False
+                        # Flip the mask because False signifies the positions to NOT ablate (and we want vice-versa)
+                        ablation_masks[node_name] = ~ablation_masks[node_name]
+        
+        # If node_threshold is provided, use it to determine additional nodes to ablate
+        if node_threshold is not None:
+            threshold_ablation_masks = self.determine_nodes_to_ablate(node_threshold)
+            
+            # Merge with nodes_to_always_ablate (always_ablate takes precedence)
+            for node_name, mask in threshold_ablation_masks.items():
+                if node_name not in ablation_masks:
+                    ablation_masks[node_name] = mask
+        else:
+            # If no threshold provided, ensure we have masks for all nodes by creating masks that ablate nothing (all False)
+            for node_name, sfc_scores in self.sfc_node_scores.node_scores.items():
+                if node_name not in ablation_masks:
+                    ablation_masks[node_name] = torch.zeros_like(sfc_scores, dtype=torch.bool, device=self.device)
+
+        # At this point we should have a complete set of masks in ablation_masks
+        assert set(ablation_masks.keys()) == set(self.sfc_node_scores.node_scores.keys())
+
+        # Step 2: Handle the nodes that we want to restore activations for despite ablation
         if nodes_to_restore is None:
             nodes_to_restore = []
         
-        # Check if the mean activations keys match the sfc_node_scores keys
-        if set(nodes_ablation_mask.keys()) != set(self.sfc_node_scores.mean_activations.keys()):
-            raise ValueError("Mismatch between circuit masks and mean activations keys.")
+        # Here there are two options: full restoration and restoration only of specific features
+        if feature_indices_to_restore is None:
+            feature_indices_to_restore = {}
+        else:
+            # Validate that feature_indices_to_restore only contains SAE feature nodes
+            for node_name in feature_indices_to_restore:
+                if "hook_sae_acts_post" not in node_name:
+                    raise ValueError(f"Feature indices can only be restored for SAE feature nodes, but got {node_name}")
+                if node_name not in nodes_to_restore:
+                    # Automatically add to nodes_to_restore if not already there
+                    nodes_to_restore.append(node_name)
+        
+        # If cutoff_early_layers is True, we don't ablate the first layers of the model
+        if cutoff_early_layers:
+            early_layer_cutoff = self.model_wrapper.n_layers // 3  # First 1/3 of layers
 
+            for key in ablation_masks.keys():
+                # Parse act name like this "blocks.5.hook_resid_post.hook_sae_acts_post"
+                layer_str = key.split('.')[1]  # Gets "5" from the example
+                layer_num = int(layer_str)
+                
+                # If node is from early layers, add to restore list and clear its ablation mask
+                if layer_num < early_layer_cutoff:
+                    if key not in nodes_to_restore:
+                        nodes_to_restore.append(key)
+
+        # Step 3: count how many nodes will be in the circuit (nodes that are not being ablated)
+        n_nodes_in_circuit = 0
+        for key, mask in ablation_masks.items():
+            n_nodes_in_circuit += torch.sum(~mask).item()  # count the number of nodes for which mask is False (i.e. not ablated)
+
+        if correct_for_the_nodes_to_restore:
+            # Account for the nodes to restore being not part of the circuit for the calculation of total circuit size
+            for key in nodes_to_restore:
+                if key in feature_indices_to_restore:
+                    # Only count the specific feature indices being restored
+                    feature_count = len(feature_indices_to_restore[key])
+                    n_nodes_in_circuit -= feature_count
+                else:
+                    # For full node restoration, count all unablated positions
+                    n_nodes_in_circuit -= torch.sum(~ablation_masks[key]).item()
+        
         # Optimization: Initialize empty circuit metrics cache if it doesn't exist
         if not hasattr(self, '_empty_circuit_metrics_cache'):
             self._empty_circuit_metrics_cache = {}
@@ -238,68 +332,50 @@ class CircuitEvaluator:
             id(clean_dataset), id(patched_dataset), 
             batch_size, total_batches
         )
-        
-        # Edit the ablation masks to include the always_ablate_fn
-        for key, mask in nodes_ablation_mask.items():
-            if always_ablate_fn(key):
-                # Set the mask to 1 for all positions
-                nodes_ablation_mask[key] = torch.ones_like(mask, dtype=torch.bool, device=self.device)
-
-        # If cutoff_early_layers is True, we must not ablate the first layers of the model
-        if cutoff_early_layers:
-            early_layer_cutoff = self.model_wrapper.n_layers // 3  # First 1/3 of layers
-    
-            for key in nodes_ablation_mask.keys():
-                # Parse something like "blocks.5.hook_resid_post.hook_sae_acts_post"
-                layer_str = key.split('.')[1]  # Gets "5" from the example
-                layer_num = int(layer_str)
-                
-                # If node is from early layers, add to restore list
-                if layer_num < early_layer_cutoff:
-                    nodes_to_restore.append(key)
-
-        # Count how many nodes were part of the circuit
-        n_nodes_in_circuit = 0
-        for key, mask in nodes_ablation_mask.items():
-            n_nodes_in_circuit += torch.sum(~mask).item() # count the number of nodes for which mask is False (i.e. not ablated)
-
-        if correct_for_the_nodes_to_restore:
-            # Account for the nodes to restore being not part of the circuit for the calculation of total circuit size
-            for key in nodes_to_restore:
-                n_nodes_in_circuit -= torch.sum(~nodes_ablation_mask[key]).item()
-        
-        # Compute the metric values for the circuit C (when nodes outside C are ablated) and the full model M
-        # I.e., in SFC paper notation, compute m(C) and m(M) respectively
+        # Optional logging
         if verbose:
-            print(f"Running model with circuit nodes ablated ({n_nodes_in_circuit} nodes in circuit) and full model...")
+            if node_threshold is not None:
+                print(f"Running model with nodes outside the circuit ablated ({n_nodes_in_circuit} nodes in circuit) and full model...")
+                
             print(f'Restoring {len(nodes_to_restore)} nodes.')
-            if early_layer_cutoff:
-                print(f'{early_layer_cutoff * 6} of them are from the first {early_layer_cutoff} layers.') # 6 because there are 3 act types (resid, mlp, attn) and 2 node types (error, sae_post)
+            feature_restore_count = sum(len(indices) for indices in feature_indices_to_restore.values())
 
+            if feature_restore_count > 0:
+                print(f'Restoring {feature_restore_count} specific features across {len(feature_indices_to_restore)} nodes.')
+            if cutoff_early_layers:
+                print(f'Not ablating first {early_layer_cutoff} layers, resulting in restorations of {early_layer_cutoff * 6} activation nodes.')
+
+        # Step 4: compute the metric values for the circuit C (when nodes outside C are ablated) and the full model M
+        # I.e., in SFC paper notation, compute m(C) and m(M) respectively
         circuit_metrics, full_model_metrics = self._run_model_with_ablation(
             clean_dataset, patched_dataset, 
             batch_size=batch_size, prompts_to_process=prompts_to_process, total_batches=total_batches,
-            nodes_to_ablate=nodes_ablation_mask, nodes_to_restore=nodes_to_restore,
-            run_full_model=True
+            nodes_to_ablate=ablation_masks, nodes_to_restore=nodes_to_restore,
+            feature_indices_to_restore=feature_indices_to_restore,
+            run_full_model=True,
+            verbose=verbose
         )
         clear_cache()
 
-        # Check if we have cached empty circuit metrics for this configuration
+        # Step 5: Compute an empty circuit metric M(∅)
+        # First, check if we have cached empty circuit metrics for this configuration
         if cache_key not in self._empty_circuit_metrics_cache:
             # If not in cache, compute empty circuit metrics
             print("Computing empty circuit metrics (will be cached)...")
             
             # Create empty circuit mask (ablate everything)
             empty_circuit_mask = {}
-            for key in self.sfc_node_scores.mean_activations.keys():
-                empty_circuit_mask[key] = torch.ones_like(nodes_ablation_mask[key], dtype=torch.bool, device=self.device)
+            for key, scores in self.sfc_node_scores.node_scores.items():
+                empty_circuit_mask[key] = torch.ones_like(scores, dtype=torch.bool, device=self.device)
             
             # Run evaluation with empty circuit
             empty_circuit_metrics, _ = self._run_model_with_ablation(
                 clean_dataset, patched_dataset, 
                 batch_size=batch_size, prompts_to_process=prompts_to_process, total_batches=total_batches,
                 nodes_to_ablate=empty_circuit_mask, nodes_to_restore=[],
-                run_full_model=False
+                feature_indices_to_restore={},
+                run_full_model=False,
+                verbose=verbose
             )
             
             # Cache the result
@@ -312,13 +388,15 @@ class CircuitEvaluator:
         faithfulness_metrics = (circuit_metrics - empty_circuit_metrics) / (full_model_metrics - empty_circuit_metrics)
         
         return faithfulness_metrics, n_nodes_in_circuit
-        
+
     def _run_model_with_ablation(self, clean_dataset: Dict[str, torch.Tensor], patched_dataset: Dict[str, torch.Tensor],
                                  batch_size: int, prompts_to_process: int, total_batches: int,
                                  nodes_to_ablate: Dict[str, torch.Tensor],
                                  nodes_to_restore: List[str] = [],
+                                 feature_indices_to_restore: Dict[str, List[int]] = None,
                                  run_full_model: bool = False,
                                  ablation_values: Optional[Dict[str, torch.Tensor]] = None, 
+                                 verbose: bool = False,
                                  ) -> Tuple[float, Optional[float]]:
         """
         Run the model with mean ablation on specified nodes at specified positions.
@@ -326,14 +404,21 @@ class CircuitEvaluator:
         Args:
             clean_dataset: The clean dataset to evaluate on
             patched_dataset: The patched dataset to evaluate on
+
             nodes_to_ablate: Dictionary mapping node names to binary masks indicating which positions 
-                (and features in case of SAE latent nodes) to ablate
+                             (and features in case of SAE latent nodes) to ablate
+
+            nodes_to_restore: List of node names to restore activation for (i.e. substitute their values as they would be without ablation)
+                              Defaults to an empty list
+            feature_indices_to_restore: Dictionary mapping node names to lists of feature indices to restore.
+                                        Only applies to SAE feature nodes (hook_sae_acts_post).
+                                        If provided for a node, only the specified indices will be restored.
+
             ablation_values: Dictionary mapping node names to their substitution values for ablation.
                 Defaults to using mean (position-aware) activation values
-            nodes_to_restore: List of node names to restore activation for (i.e. substitute their values as they would be without ablation)
-                Defaults to an empty list
+
             run_full_model: Whether to run the full model without ablation for returning the full model metric value.
-                Must be true when nodes_to_restore is not empty.
+                            Must be true when nodes_to_restore is not empty.
             batch_size: Number of examples to process at once
             total_batches: Total number of batches to process
             
@@ -357,13 +442,17 @@ class CircuitEvaluator:
             print("Setting run_full_model to True.")
             run_full_model = True 
 
+        # Initialize feature_indices_to_restore if None
+        if feature_indices_to_restore is None:
+            feature_indices_to_restore = {}
+
         # Perform mean ablation by default
         if ablation_values is None:
             ablation_values = self.sfc_node_scores.mean_activations
 
         # We'll intervene on every SAE latent node and every error node
         def act_to_hook_on(act_name):
-            return 'hook_sae_post' in act_name or 'hook_sae_error' in act_name
+            return 'hook_sae_acts_post' in act_name or 'hook_sae_error' in act_name
 
         # Also define the hook selection function only for nodes_to_restore
         def act_to_hook_on_restore(act_name):
@@ -378,10 +467,32 @@ class CircuitEvaluator:
             """
             # First, restore the original activations for the nodes to restore
             if hook.name in nodes_to_restore:
-                return original_act_cache[hook.name]
+                if verbose:
+                    print(f'Restoring {hook.name}')
+                # SAE feature nodes might have specific indices to restore
+                if hook.name in feature_indices_to_restore and "hook_sae_acts_post" in hook.name:
+                    # Get the indices to restore
+                    indices = feature_indices_to_restore[hook.name]
+                    if verbose:
+                        print(f'    using specific indicies: {indices}')
+                    
+                    # Get the original activations
+                    original_acts = original_act_cache[hook.name]
+                    
+                    # Restore only the specified indices
+                    # act has shape [batch, pos, d_sae]
+                    # We need to restore act[:, :, indices] from original_acts[:, :, indices]
+                    act[:, :, indices] = original_acts[:, :, indices]
+                    
+                    return act
+                else:
+                    # For other nodes, restore the entire activation
+                    return original_act_cache[hook.name]
 
             # Get the mask indicating which nodes to ablate
             ablation_mask = nodes_to_ablate[hook.name]
+            if verbose and ablation_mask.sum().item() > 0:
+                print(f'Ablating {hook.name} in {ablation_mask.sum().item()} positions')
 
             # Get the corresponding ablation values
             current_ablation_values = ablation_values[hook.name]
@@ -441,6 +552,7 @@ class CircuitEvaluator:
 
             return act
         # end of ablation_hook
+
         # Now, initialize the metric values
         if run_full_model:
             full_model_metrics_list = []
@@ -473,8 +585,8 @@ class CircuitEvaluator:
                                                                      fwd_hooks=[(act_to_hook_on, current_hook)])
             # Calculate logit difference for the clean prompts (if the model is accurate it should be negative, hence the minus in front)
             ablated_metric_value = -self.model_wrapper.get_logit_diff(ablated_logits, clean_answers=clean_answers,
-                                                                        patched_answers=corrupted_answers,
-                                                                        answer_pos=clean_answers_pos)
+                                                                      patched_answers=corrupted_answers,
+                                                                      answer_pos=clean_answers_pos)
             ablated_metrics_list.append(ablated_metric_value.mean().item())
 
             # Free memory
@@ -484,6 +596,7 @@ class CircuitEvaluator:
             clear_cache()
 
             # Now repeat the same for corrupted prompts
+            verbose = False # no need to log anymore
             if run_full_model:
                 # Run the model without ablations to collect the original activations
                 corrupted_logits, corrupted_cache = self.model_wrapper.model.run_with_cache(corrupted_prompts, attention_mask=corrupted_attn_mask,
@@ -504,8 +617,8 @@ class CircuitEvaluator:
                                                                      fwd_hooks=[(act_to_hook_on, current_hook)])
             # Calculate logit difference for the corrupted prompts (if the model is accurate it should be positive)
             ablated_metric_value = self.model_wrapper.get_logit_diff(ablated_logits, clean_answers=clean_answers,
-                                                                      patched_answers=corrupted_answers,
-                                                                      answer_pos=corrupted_answers_pos)
+                                                                     patched_answers=corrupted_answers,
+                                                                     answer_pos=corrupted_answers_pos)
             ablated_metrics_list.append(ablated_metric_value.mean().item())
 
             # Free memory

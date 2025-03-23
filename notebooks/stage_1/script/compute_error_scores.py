@@ -240,7 +240,7 @@ from torch import Tensor
 torch.set_grad_enabled(False)
 
 # Device setup
-GPU_TO_USE = 1
+GPU_TO_USE = 3
 
 if torch.backends.mps.is_available():
     device = "mps"
@@ -278,11 +278,21 @@ def get_data_path(base_folder=None, data_folder_name='data'):
 
 	return Path(base_folder) / data_folder_name
 
+def get_project_folder(base_folder=None, project_folder_name='sfc-errors'):
+	if base_folder is None:
+		base_folder = get_base_folder()
+	
+	return Path(base_folder) / project_folder_name
+
 base_path = get_base_folder()
 print(f"Base path: {base_path}")
 
+project_path = get_project_folder(base_folder=base_path)
+print(f"Project path: {project_path}")
+
 # Add the parent directory (sfc_deception) to sys.path
 sys.path.append(base_path)
+sys.path.append(str(project_path))
 
 datapath = get_data_path(base_path) 
 datapath
