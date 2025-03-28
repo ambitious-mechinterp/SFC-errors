@@ -20,7 +20,8 @@ def clear_cache():
 
 class CircuitEvaluator:
     """
-    Class for evaluating circuit faithfulness.
+    Class for evaluating circuit faithfulness, 
+    where circuit is generally understood as any subset of SAE/error nodes that are not ablated.
     """
     def __init__(self, model_wrapper, sfc_node_scores: SFC_NodeScores = None):
         """
@@ -184,7 +185,8 @@ class CircuitEvaluator:
                                       cutoff_early_layers=True,
                                       correct_for_the_nodes_to_restore=False,
                                       batch_size=100, total_batches=None,
-                                      verbose=True) -> Tuple[torch.Tensor, int]:
+                                      verbose=True,
+                                      return_all_metrics=False) -> Tuple[torch.Tensor, int]:
         """
         Evaluate the faithfulness of a circuit by selectively ablating and restoring nodes.
         
@@ -206,13 +208,16 @@ class CircuitEvaluator:
 
             cutoff_early_layers: Whether to exclude early layers (first 1/3 of the model) from ablation
             correct_for_the_nodes_to_restore: Whether to correct the number of nodes in the circuit for the nodes to restore
+            return_all_metrics: Whether to return a tensor of all 2*N faithfulness scores for each of N prompts from the clean and patched datasets
+                                Default is False, which means that the scores are aggregated across `total_batches` batches
 
             batch_size: Number of examples to process at once
             total_batches: Total number of batches to process
             verbose: Whether to print progress information
             
         Returns:
-            - Faithfulness metrics tensor of shape [total_batches * 2] (2 multiplier comes from the use of both clean & patched dataset),
+            - Faithfulness metrics tensor of shape [total_batches * 2] (2 multiplier comes from the use of both clean & patched dataset)
+              OR of shape [total_samples * 2] if return_all_metrics = True,
             - Total number of nodes in the circuit
         """
         # Check if we have the mean activations pre-computed
@@ -276,7 +281,7 @@ class CircuitEvaluator:
         # At this point we should have a complete set of masks in ablation_masks
         assert set(ablation_masks.keys()) == set(self.sfc_node_scores.node_scores.keys())
 
-        # Step 2: Handle the nodes that we want to restore activations for despite ablation
+        # Step 2: Handle the nodes that we want to restore activations for (i.e. patch in their activations as they would have been without ablation)
         if nodes_to_restore is None:
             nodes_to_restore = []
         
@@ -353,11 +358,12 @@ class CircuitEvaluator:
             nodes_to_ablate=ablation_masks, nodes_to_restore=nodes_to_restore,
             feature_indices_to_restore=feature_indices_to_restore,
             run_full_model=True,
-            verbose=verbose
+            verbose=verbose,
+            return_all_metrics=return_all_metrics
         )
         clear_cache()
 
-        # Step 5: Compute an empty circuit metric M(∅)
+        # Step 5: Compute an empty circuit metric m(∅)
         # First, check if we have cached empty circuit metrics for this configuration
         if cache_key not in self._empty_circuit_metrics_cache:
             # If not in cache, compute empty circuit metrics
@@ -375,7 +381,8 @@ class CircuitEvaluator:
                 nodes_to_ablate=empty_circuit_mask, nodes_to_restore=[],
                 feature_indices_to_restore={},
                 run_full_model=False,
-                verbose=verbose
+                verbose=verbose,
+                return_all_metrics=return_all_metrics
             )
             
             # Cache the result
@@ -384,7 +391,6 @@ class CircuitEvaluator:
             # Use cached empty circuit metrics
             empty_circuit_metrics = self._empty_circuit_metrics_cache[cache_key]
 
-        # Our metrics are now tensors of shape [total_batches * 2]
         faithfulness_metrics = (circuit_metrics - empty_circuit_metrics) / (full_model_metrics - empty_circuit_metrics)
         
         return faithfulness_metrics, n_nodes_in_circuit
@@ -397,9 +403,11 @@ class CircuitEvaluator:
                                  run_full_model: bool = False,
                                  ablation_values: Optional[Dict[str, torch.Tensor]] = None, 
                                  verbose: bool = False,
+                                 return_all_metrics=False,
                                  ) -> Tuple[float, Optional[float]]:
         """
         Run the model with mean ablation on specified nodes at specified positions.
+        Optionally, restore the activations of other specified nodes, i.e. patch in their activations as they would have been without ablation.
         
         Args:
             clean_dataset: The clean dataset to evaluate on
@@ -415,27 +423,20 @@ class CircuitEvaluator:
                                         If provided for a node, only the specified indices will be restored.
 
             ablation_values: Dictionary mapping node names to their substitution values for ablation.
-                Defaults to using mean (position-aware) activation values
-
+                             Defaults to using mean (position-aware) activation values
             run_full_model: Whether to run the full model without ablation for returning the full model metric value.
-                            Must be true when nodes_to_restore is not empty.
+                            Must be true when nodes_to_restore is not empty, because we need the original cache to restore the activations.
+
             batch_size: Number of examples to process at once
             total_batches: Total number of batches to process
+            return_all_metrics: Whether to return a tensor of all 2*N faithfulness scores for each of N prompts from the clean and patched datasets
+                                Default is False, which means that the scores are aggregated across `total_batches` batches
             
         Returns:
-            (ablated_metric_value, full_model_metric_value),
-                if nodes_to_restore is not empty, otherwise just ablated_metric_value.
-            This is done to avoid running the full model if not necessary for restoring the activations.
-
-        Note:
-            - The returned metric values are Tensors with the shape [total_batches * 2]:
-                [
-                    metric_value_on_clean_prompts_batch_1,
-                    metric_value_on_patched_prompts_batch_1,
-                    ...
-                    metric_value_on_clean_prompts_batch_n,
-                    metric_value_on_patched_prompts_batch_n
-                ]
+            Tuple containing:
+            - ablated_metric_tensor: Metrics with ablations applied
+            - full_model_metric_tensor: Metrics from full model (if run_full_model=True)
+            where metric is a logit dif between correct and incorrect answer tokens
         """
         if nodes_to_restore and not run_full_model:
             print("WARNING: If nodes_to_restore is not empty, run_full_model must be True, but the passed value is False.")
@@ -557,7 +558,7 @@ class CircuitEvaluator:
         if run_full_model:
             full_model_metrics_list = []
         ablated_metrics_list = []
-        
+
         # Process each batch
         for i in tqdm(range(0, prompts_to_process, batch_size)):
             # Sample from clean and corrupted datasets
@@ -573,7 +574,10 @@ class CircuitEvaluator:
                 clean_metric_value = -self.model_wrapper.get_logit_diff(clean_logits, clean_answers=clean_answers,
                                                                         patched_answers=corrupted_answers,
                                                                         answer_pos=clean_answers_pos)
-                full_model_metrics_list.append(clean_metric_value.mean().item())
+                if not return_all_metrics:
+                    full_model_metrics_list.append(clean_metric_value.mean().item())
+                else:
+                    full_model_metrics_list.append(clean_metric_value)
 
                 # Store the original activations for the nodes to restore
                 current_hook = lambda act, hook: ablation_hook(act, hook, clean_cache)
@@ -587,7 +591,10 @@ class CircuitEvaluator:
             ablated_metric_value = -self.model_wrapper.get_logit_diff(ablated_logits, clean_answers=clean_answers,
                                                                       patched_answers=corrupted_answers,
                                                                       answer_pos=clean_answers_pos)
-            ablated_metrics_list.append(ablated_metric_value.mean().item())
+            if not return_all_metrics:
+                ablated_metrics_list.append(ablated_metric_value.mean().item())
+            else:
+                ablated_metrics_list.append(ablated_metric_value)
 
             # Free memory
             del ablated_logits, clean_prompts, clean_answers_pos, clean_attn_mask, current_hook
@@ -605,7 +612,11 @@ class CircuitEvaluator:
                 corrupted_metric_value = self.model_wrapper.get_logit_diff(corrupted_logits, clean_answers=clean_answers,
                                                                              patched_answers=corrupted_answers,
                                                                              answer_pos=corrupted_answers_pos)
-                full_model_metrics_list.append(corrupted_metric_value.mean().item())
+
+                if not return_all_metrics:                                                         
+                    full_model_metrics_list.append(corrupted_metric_value.mean().item())
+                else:
+                    full_model_metrics_list.append(corrupted_metric_value)
 
                 # Store the original activations for the nodes to restore
                 current_hook = lambda act, hook: ablation_hook(act, hook, corrupted_cache)
@@ -619,7 +630,10 @@ class CircuitEvaluator:
             ablated_metric_value = self.model_wrapper.get_logit_diff(ablated_logits, clean_answers=clean_answers,
                                                                      patched_answers=corrupted_answers,
                                                                      answer_pos=corrupted_answers_pos)
-            ablated_metrics_list.append(ablated_metric_value.mean().item())
+            if not return_all_metrics:
+                ablated_metrics_list.append(ablated_metric_value.mean().item())
+            else:
+                ablated_metrics_list.append(ablated_metric_value)
 
             # Free memory
             del ablated_logits, corrupted_prompts, corrupted_answers_pos, corrupted_attn_mask, clean_answers, corrupted_answers, current_hook
@@ -627,10 +641,18 @@ class CircuitEvaluator:
                 del corrupted_cache, corrupted_logits
             clear_cache()
 
-        # Convert metric lists to tensors and return them
-        ablated_metric_tensor = torch.tensor(ablated_metrics_list).to(self.device)
+            # Convert metric lists to tensors and return them
+            if not return_all_metrics:
+                ablated_metric_tensor = torch.tensor(ablated_metrics_list).to(self.device)
+            else:
+                ablated_metric_tensor = torch.concat(ablated_metrics_list).to(self.device)
+        
         if run_full_model:
-            full_model_metric_tensor = torch.tensor(full_model_metrics_list).to(self.device)
+            if not return_all_metrics: 
+                full_model_metric_tensor = torch.tensor(full_model_metrics_list).to(self.device)
+            else:
+                full_model_metric_tensor = torch.concat(full_model_metrics_list).to(self.device)
+
             return ablated_metric_tensor, full_model_metric_tensor
         else:
             return ablated_metric_tensor, None

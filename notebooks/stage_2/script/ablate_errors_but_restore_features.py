@@ -126,10 +126,10 @@ DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
 dataloader = SFCDatasetLoader(DATASET_NAME, model, num_samples=10000,
                               local_dataset=True, base_folder_path=datapath)
 
-experiment_name = 'sva_rc_test'
-saving_dir = datapath / experiment_name
+EXPERIMENT = 'sva_rc_test'
+saving_dir = datapath / EXPERIMENT
 
-print(f'Using {SupportedDatasets.VERB_AGREEMENT_TEST} dataset and saving to the dir data/{experiment_name}.')
+print(f'Using {SupportedDatasets.VERB_AGREEMENT_TEST} dataset and saving to the dir data/{EXPERIMENT}.')
 
 
 clean_dataset, corrupted_dataset = dataloader.get_clean_corrupted_datasets(tokenize=True, apply_chat_template=False, prepend_generation_prefix=True)
@@ -197,8 +197,6 @@ caching_device
 # - Loads a Gemma model and its Gemma Scope SAEs (either attaching them to the model or not)
 # - Provides interface methods to compute SFC scores (currently, only attr patching is supported) on an arbitrary dataset (that follows the format of my SFCDatasetLoader class from above)
 
-EXPERIMENT = 'sva_rc'
-
 clear_cache()
 sfc_model = SFC_Gemma(model, params_count=PARAMS_COUNT, control_seq_len=CONTROL_SEQ_LEN, 
                       attach_saes=RUN_WITH_SAES, caching_device=caching_device,
@@ -219,6 +217,7 @@ from classes.sfc_evaluator import CircuitEvaluator
 circuit_evaluator = CircuitEvaluator(sfc_model)
 
 
+# Define utilities for displaying the features we'll select to restore
 def display_selected_features(selected_nodes_info, sfc_node_scores, 
                               abs_scores=False, print_k_positions=10):
     """
@@ -278,7 +277,6 @@ def display_selected_features(selected_nodes_info, sfc_node_scores,
                         score = node_scores[pos, feat_idx].item()
                     
                     print(f"    Feature {feat_idx}: position {pos}, score {score:.6f}")
-
 
 def display_neuronpedia_features(selected_nodes_info, model_name='gemma-2-2b', max_features_per_type=3, 
                                  sfc_node_scores=None, abs_scores=False):
@@ -396,6 +394,10 @@ def display_neuronpedia_features(selected_nodes_info, model_name='gemma-2-2b', m
 
 # ## Defining the set of SAE latents to restore
 
+# Here we'll inspect the features we'll be restoring in the code. Restoring means:
+# - Patching in original activations from unaffected pass (w/o ablations), into the forward pass that is affected by ablations.
+# - i.e. patching in feature activations as they would have been without any ablations
+
 layers_to_extract = [
     # [18, 19, 20, 21, 22, 23, 24, 25],
     # [18, 19, 20, 21, 22, 23, 24],
@@ -406,8 +408,8 @@ layers_to_extract = [
     [18, 19],
     [18]
 ]
-top_k_counts = [3, 5, 10, 25, 50, 100]
-positions_to_select = [2, 6]  # Only consider features maximizing at these positions
+top_k_counts = [5, 10, 25, 50, 100]
+positions_to_select = [2, 6]  # Only restore features at these token positions - same positions where we'll ablate the error nodes
 
 extraction_params = {
     'abs_scores': False,
@@ -441,7 +443,7 @@ for layer_idx, layer in enumerate(layers_to_extract):
         # Display the selected nodes with their maximizing positions
         display_selected_features(selected_nodes_info, circuit_evaluator.sfc_node_scores, abs_scores, print_k_positions=0)
         
-        # Display Neuronpedia visualizations for top features by score
+        # Optionally display Neuronpedia visualizations for top features by score
         # display_neuronpedia_features(
         #     selected_nodes_info, 
         #     max_features_per_type=3,
@@ -452,12 +454,14 @@ for layer_idx, layer in enumerate(layers_to_extract):
 
 # ## Running the ablation & restoration loop (variable top-k)
 
+# Main experiment of the notebook: ablate ALL residual error nodes from the most important positions (2 and 6), and try to restore a variable number of latents from a variable range of layers => see how much faithfulness we can recover. More details [here](https://docs.google.com/document/d/1vZrGsoGDEu5MLcL9Iisi0mctW1c-6j37sdSP88GfWaA/edit?tab=t.0#heading=h.ph3mduyhoipd)
+
 import pandas as pd
 from collections import defaultdict
 
 # ablate all resid error nodes up until (and including) this threshold 
-ERRORS_LAYER_THRESHOLD_TOP = 17
-ERRORS_LAYER_THRESHOLD_BOTTOM = 14
+ERRORS_LAYER_THRESHOLD_TOP = 25
+ERRORS_LAYER_THRESHOLD_BOTTOM = 0
 
 # Define error ablation function for this threshold
 def ablate_error_hook(act_name):
@@ -470,6 +474,7 @@ def ablate_error_hook(act_name):
     
     return ERRORS_LAYER_THRESHOLD_BOTTOM <= error_layer_num <= ERRORS_LAYER_THRESHOLD_TOP
 
+# Consult the CircuitEvaluator.evaluate_circuit_faithfulness() method documentation for the meaning of the params below
 evaluation_params = {
     'cutoff_early_layers': False,
     'nodes_to_always_ablate': ablate_error_hook,
@@ -534,14 +539,22 @@ for layer_idx, layer in enumerate(layers_to_extract):
         faithfulness_metrics, n_nodes_in_circuit = circuit_evaluator.evaluate_circuit_faithfulness(
             clean_dataset=clean_dataset,
             patched_dataset=corrupted_dataset,
+            # comment out these lines if you want to get the baseline faithfulness (without restoration)
             nodes_to_restore=nodes_to_restore,
             feature_indices_to_restore=feature_indices_dict,
+            # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            return_all_metrics=True,
             **evaluation_params
         )
         
-        # Extract useful statistics from faithfulness_metrics
-        mean_faithfulness = faithfulness_metrics.mean().item()
-        std_faithfulness = faithfulness_metrics.std().item()
+        # Before computing the mean and std metrics, filter out infs which seem to be pathological
+        faithfulness_finite_mask = torch.isfinite(faithfulness_metrics)
+        infinite_values_count = (~faithfulness_finite_mask).sum()
+        if infinite_values_count > 0:
+            print(f'Filtered out {infinite_values_count} infinite metrics')
+        
+        mean_faithfulness = faithfulness_metrics[faithfulness_finite_mask].mean().item()
+        std_faithfulness = faithfulness_metrics[faithfulness_finite_mask].std().item()
         
         # Store all the results
         results['layer'].append(layer)
@@ -552,7 +565,8 @@ for layer_idx, layer in enumerate(layers_to_extract):
         results['std_faithfulness'].append(std_faithfulness)
 
         # Save the actual faithfulness metrics tensor for potential future analysis
-        # detailed_results[config_key]['faithfulness_metrics'] = faithfulness_metrics.cpu().numpy()
+        metric_save_path = saving_dir / f'faithfulness_metrics_layer_{max(layer)}_topk_{top_k_value}.pt'
+        torch.save(faithfulness_metrics, metric_save_path)
         
         # Also collect position statistics
         position_stats = {}
@@ -580,11 +594,14 @@ for layer_idx, layer in enumerate(layers_to_extract):
         
         print(f"Layer {layer}, Top {top_k_value}: Mean faithfulness = {mean_faithfulness:.4f}")
 
+        del faithfulness_metrics
+        clear_cache()
+
 
 # Create DataFrame from the collected results
 results_df = pd.DataFrame(results)
 
-SAVING_NAME_SUFFIX = 'layers_14_17_ablated'
+SAVING_NAME_SUFFIX = ''
 SAVING_NAME_SUFFIX = '_' + SAVING_NAME_SUFFIX if SAVING_NAME_SUFFIX else SAVING_NAME_SUFFIX
 
 SAVING_NAME_RESULTS = f'faithfulness_with_different_topk{SAVING_NAME_SUFFIX}.csv'
@@ -709,6 +726,8 @@ plot_faithfulness_vs_layer_ranges(results_df, layers_to_extract)
 
 # ## Running the ablation & restoration loop (variable upper-layer threshold)
 
+# This is a follow-up experiment where we tried to inverstigate how much late error nodes matter by stopping the error node ablation at a specific layer (e.g. ablate error nodes only up to layer 24). More details [here](https://docs.google.com/document/d/1vZrGsoGDEu5MLcL9Iisi0mctW1c-6j37sdSP88GfWaA/edit?tab=t.0#heading=h.xlv8adcign93)
+
 import pandas as pd
 from collections import defaultdict
 
@@ -739,113 +758,113 @@ if RUN_WITH_SAES:
 clear_cache()
 
 
-# for layer_idx, layer in enumerate(layers_to_extract):
-#     print(f"\n{'='*80}\nLAYER {layer}\n{'='*80}")
+for layer_idx, layer in enumerate(layers_to_extract):
+    print(f"\n{'='*80}\nLAYER {layer}\n{'='*80}")
     
-#     # First, extract the features once (since we're using a fixed top_k)
-#     selected_nodes_info = circuit_evaluator.sfc_node_scores.get_top_k_features_by_layer(
-#         layer, 
-#         top_k_counts=top_k_value,
-#         verbose=False,  # Turn off built-in verbose output for cleaner display
-#         **extraction_params
-#     )
+    # First, extract the features once (since we're using a fixed top_k)
+    selected_nodes_info = circuit_evaluator.sfc_node_scores.get_top_k_features_by_layer(
+        layer, 
+        top_k_counts=top_k_value,
+        verbose=False,  # Turn off built-in verbose output for cleaner display
+        **extraction_params
+    )
     
-#     # Unpack the returned data
-#     feature_indices_dict, maximizing_positions_dict = selected_nodes_info
+    # Unpack the returned data
+    feature_indices_dict, maximizing_positions_dict = selected_nodes_info
     
-#     # Loop over different error layer thresholds
-#     for threshold in error_layer_thresholds:
-#         print(f"\n{'-'*60}\nError Layer Threshold {threshold}\n{'-'*60}")
+    # Loop over different error layer thresholds
+    for threshold in error_layer_thresholds:
+        print(f"\n{'-'*60}\nError Layer Threshold {threshold}\n{'-'*60}")
         
-#         # Create a unique key for this configuration
-#         config_key = f"layer_{layer}_top_{top_k_value}_error_threshold_{threshold}"
+        # Create a unique key for this configuration
+        config_key = f"layer_{layer}_top_{top_k_value}_error_threshold_{threshold}"
         
-#         # Define error ablation function for this threshold
-#         def ablate_error_hook(act_name):
-#             if 'hook_resid_post.hook_sae_error' not in act_name:
-#                 return False
+        # Define error ablation function for this threshold
+        def ablate_error_hook(act_name):
+            if 'hook_resid_post.hook_sae_error' not in act_name:
+                return False
                 
-#             # Split the input string by periods
-#             parts = act_name.split('.')
-#             error_layer_num = int(parts[1])
+            # Split the input string by periods
+            parts = act_name.split('.')
+            error_layer_num = int(parts[1])
             
-#             return error_layer_num <= threshold
+            return error_layer_num <= threshold
         
-#         # Update evaluation parameters with the current threshold function
-#         current_eval_params = evaluation_params.copy()
-#         current_eval_params['nodes_to_always_ablate'] = ablate_error_hook
+        # Update evaluation parameters with the current threshold function
+        current_eval_params = evaluation_params.copy()
+        current_eval_params['nodes_to_always_ablate'] = ablate_error_hook
         
-#         # Save the detailed feature information
-#         detailed_results[config_key] = {
-#             'feature_indices': feature_indices_dict,
-#             'maximizing_positions': maximizing_positions_dict,
-#             'layer': layer,
-#             'top_k': top_k_value,
-#             'error_threshold': threshold
-#         }
+        # Save the detailed feature information
+        detailed_results[config_key] = {
+            'feature_indices': feature_indices_dict,
+            'maximizing_positions': maximizing_positions_dict,
+            'layer': layer,
+            'top_k': top_k_value,
+            'error_threshold': threshold
+        }
         
-#         # Prepare nodes_to_restore and feature_indices_to_restore for circuit evaluation
-#         nodes_to_restore = list(feature_indices_dict.keys())  # All nodes with selected features
+        # Prepare nodes_to_restore and feature_indices_to_restore for circuit evaluation
+        nodes_to_restore = list(feature_indices_dict.keys())  # All nodes with selected features
         
-#         # Evaluate circuit faithfulness
-#         faithfulness_metrics, n_nodes_in_circuit = circuit_evaluator.evaluate_circuit_faithfulness(
-#             clean_dataset=clean_dataset,
-#             patched_dataset=corrupted_dataset,
-#             nodes_to_restore=nodes_to_restore,
-#             feature_indices_to_restore=feature_indices_dict,
-#             **current_eval_params
-#         )
+        # Evaluate circuit faithfulness
+        faithfulness_metrics, n_nodes_in_circuit = circuit_evaluator.evaluate_circuit_faithfulness(
+            clean_dataset=clean_dataset,
+            patched_dataset=corrupted_dataset,
+            nodes_to_restore=nodes_to_restore,
+            feature_indices_to_restore=feature_indices_dict,
+            **current_eval_params
+        )
         
-#         # Extract useful statistics from faithfulness_metrics
-#         mean_faithfulness = faithfulness_metrics.mean().item()
-#         std_faithfulness = faithfulness_metrics.std().item()
+        # Extract useful statistics from faithfulness_metrics
+        mean_faithfulness = faithfulness_metrics.mean().item()
+        std_faithfulness = faithfulness_metrics.std().item()
         
-#         # Store all the results
-#         results['layer'].append(layer)
-#         results['top_k'].append(top_k_value)
-#         results['error_threshold'].append(threshold)
-#         results['num_selected_features'].append(sum(len(indices) for indices in feature_indices_dict.values()))
-#         results['circuit_size'].append(n_nodes_in_circuit)
-#         results['mean_faithfulness'].append(mean_faithfulness)
-#         results['std_faithfulness'].append(std_faithfulness)
+        # Store all the results
+        results['layer'].append(layer)
+        results['top_k'].append(top_k_value)
+        results['error_threshold'].append(threshold)
+        results['num_selected_features'].append(sum(len(indices) for indices in feature_indices_dict.values()))
+        results['circuit_size'].append(n_nodes_in_circuit)
+        results['mean_faithfulness'].append(mean_faithfulness)
+        results['std_faithfulness'].append(std_faithfulness)
         
-#         # Also collect position statistics
-#         position_stats = {}
-#         for node_name, positions in maximizing_positions_dict.items():
-#             # Convert to numpy array for easier analysis
-#             pos_array = positions.cpu().numpy()
-#             position_stats[node_name] = {
-#                 'position_counts': {int(pos): int(count) for pos, count in 
-#                                    zip(*np.unique(pos_array, return_counts=True))}
-#             }
+        # Also collect position statistics
+        position_stats = {}
+        for node_name, positions in maximizing_positions_dict.items():
+            # Convert to numpy array for easier analysis
+            pos_array = positions.cpu().numpy()
+            position_stats[node_name] = {
+                'position_counts': {int(pos): int(count) for pos, count in 
+                                   zip(*np.unique(pos_array, return_counts=True))}
+            }
         
-#         detailed_results[config_key]['position_stats'] = position_stats
+        detailed_results[config_key]['position_stats'] = position_stats
         
-#         print(f"Layer {layer}, Error Threshold {threshold}: Mean faithfulness = {mean_faithfulness:.4f}")
+        print(f"Layer {layer}, Error Threshold {threshold}: Mean faithfulness = {mean_faithfulness:.4f}")
 
 
 # ### Plotting
 
-# # Create DataFrame from the collected results
-# results_df = pd.DataFrame(results)
+# Create DataFrame from the collected results
+results_df = pd.DataFrame(results)
 
-# # Display the results
-# print("\nSummary of results:")
-# print(results_df)
+# Display the results
+print("\nSummary of results:")
+print(results_df)
 
-# # If needed, convert layer values to proper types
-# # This handles cases where layer might be a list or the last element of a range
-# results_df['layer'] = results_df['layer'].apply(lambda x: x if isinstance(x, int) else max(x))
+# If needed, convert layer values to proper types
+# This handles cases where layer might be a list or the last element of a range
+results_df['layer'] = results_df['layer'].apply(lambda x: x if isinstance(x, int) else max(x))
 
-# # Save the results for future use
-# results_df.to_csv(saving_dir / "faithfulness_with_error_thresholds.csv", index=False)
+# Save the results for future use
+results_df.to_csv(saving_dir / "faithfulness_with_error_thresholds.csv", index=False)
 
-# # Save detailed results as pickle
-# import pickle
-# with open(saving_dir / "faithfulness_with_error_thresholds_detailed.pkl", "wb") as f:
-#     pickle.dump(detailed_results, f)
+# Save detailed results as pickle
+import pickle
+with open(saving_dir / "faithfulness_with_error_thresholds_detailed.pkl", "wb") as f:
+    pickle.dump(detailed_results, f)
 
-# print(f"\nResults saved to 'faithfulness_with_error_thresholds.csv' and 'faithfulness_with_error_thresholds_detailed.pkl' within {saving_dir}")
+print(f"\nResults saved to 'faithfulness_with_error_thresholds.csv' and 'faithfulness_with_error_thresholds_detailed.pkl' within {saving_dir}")
 
 
 def plot_faithfulness_heatmap(results_df, layer_ranges=None):
@@ -937,16 +956,18 @@ def plot_faithfulness_heatmap(results_df, layer_ranges=None):
     return heatmap_data, x_labels, thresholds
 
 
-# # Plot the heatmap
-# heatmap_data, x_labels, thresholds = plot_faithfulness_heatmap(results_df, layers_to_extract)
+# Plot the heatmap
+heatmap_data, x_labels, thresholds = plot_faithfulness_heatmap(results_df, layers_to_extract)
 
 
-# # Хуйотінг
+# ## Sliding window ablation
+
+# This is a follow-up experiment aimed to understand how much ablation of contiguous subset of error node matters compared to ablating 14-17 error nodes from above. More details [here](https://docs.google.com/document/d/1vZrGsoGDEu5MLcL9Iisi0mctW1c-6j37sdSP88GfWaA/edit?tab=t.0#heading=h.w5rrs58232s)
 
 import pandas as pd
 from collections import defaultdict
 
-# Define ranges for error layers to test - each loop will ablate ONE specific error layer
+# Define ranges for error layers to test
 error_layers_to_ablate = list(range(26))  # From 0 to 25
 
 evaluation_params = {
@@ -1126,7 +1147,7 @@ for i in range(len(df)):
 # ## Looking at which token positions contain the most important features
 
 # Sanity check: make sure I can reproduce the same top-k ranking as returned by the get_top_k_features_by_layer
-LAYER = 22
+LAYER = 18
 act_to_check = f'blocks.{LAYER}.hook_resid_post.hook_sae_acts_post'
 
 resid_latents = circuit_evaluator.sfc_node_scores.select_node_scores(lambda act: act == act_to_check)[act_to_check]
@@ -1145,22 +1166,7 @@ for i in range(PRINT_K):
     print(f'Feature #{top_features[i]} with score = {top_values[i]:.6f} selected from position {POSITIONS[maximizing_tok_positions[top_features[i]]]}')
 
 
-# This is consistent with the output we got from the `get_top_k_features_by_layer` method:
-
-# ```
-# hook_resid_post (100 features):
-#   Indices: [10665, 1506, 4442, 15377, 1271] ... [299, 1841, 4651, 7909, 10213]
-#   Maximizing positions distribution:
-#     Position 2: 27 features (27.0%)
-#     Position 6: 73 features (73.0%)
-# 
-#   Sample features and their maximizing positions:
-#     Feature 10665: position 6, score 0.020020
-#     Feature 1506: position 2, score 0.006042
-#     Feature 4442: position 6, score 0.002594
-#     Feature 15377: position 2, score 0.001610
-#     Feature 1271: position 2, score 0.001534
-# ```
+# This is consistent with the output we got from the `get_top_k_features_by_layer` method if you scroll above.
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1280,14 +1286,16 @@ datapath
 
 # ## Plots
 
+# ### Comparing restoration of all resid error nodes vs 14-17 error nodes
+
+# Load the two csv files with results of the standard ablation experiment (ablate all error nodes) with the results of "ablate 14-17 error nodes" experiment
+
 # Load the CSV files with our metrics
 EXPERIMENT = 'sva_rc_test'
 
 standard_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_with_different_topk.csv")
 modified_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_with_different_topk_layers_14_17_ablated.csv")
 
-
-# ### Comparing restoration of only resid SAE nodes vs all SAE nodes
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -1298,6 +1306,8 @@ from plotly.subplots import make_subplots
 def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modified_title='modified', baseline=0):
     """
     Plot faithfulness vs layer ranges for both original and modified results using Plotly.
+    This version omits error bars/bands and focuses on clean line visualization.
+    Uncertainty information is reported in the printed summary table instead.
     
     Args:
         results: DataFrame containing the original results with integer 'layer' column
@@ -1330,13 +1340,11 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
         # Prepare data points for plotting original results
         x_positions_orig = []
         y_values_orig = []
-        y_errors_orig = []
         hover_texts_orig = []
         
         # Prepare data points for plotting modified results
         x_positions_mod = []
         y_values_mod = []
-        y_errors_mod = []
         hover_texts_mod = []
         
         # Process each layer
@@ -1350,7 +1358,6 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
                 
                 x_positions_orig.append(layer)
                 y_values_orig.append(row['mean_faithfulness'])
-                y_errors_orig.append(row.get('std_faithfulness', 0))
                 
                 # Create hover text with additional information
                 hover_text = f"Layer: {layer}<br>"
@@ -1375,17 +1382,16 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
                 
                 x_positions_mod.append(layer)
                 y_values_mod.append(modified_faithfulness)
-                y_errors_mod.append(row.get('std_faithfulness', 0))
                 
                 # Create hover text with additional information
                 hover_text = f"Layer: {layer}<br>"
                 hover_text += f"Top K: {k}<br>"
                 hover_text += f"Mean Faithfulness: {modified_faithfulness:.4f}<br>"
                 hover_text += f"Original Value: {row['mean_faithfulness']:.4f}<br>"
+                hover_text += f"Std Deviation: {row.get('std_faithfulness', 0):.4f}<br>"
                 hover_text += f"Baseline: {baseline}<br>"
                 if np.abs(baseline) > 1e-3:
                     hover_text += f"Normalization: (value - {baseline}) / (1 - {baseline})<br>"
-                hover_text += f"Std Deviation: {row.get('std_faithfulness', 0):.4f}<br>"
                 hover_text += f"Selected Features: {row['num_selected_features']}"
                 hover_texts_mod.append(hover_text)
         
@@ -1394,14 +1400,6 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
             fig.add_trace(go.Scatter(
                 x=x_positions_orig,
                 y=y_values_orig,
-                error_y=dict(
-                    type='data',
-                    array=y_errors_orig,
-                    visible=True,
-                    color=color,
-                    thickness=1.5,
-                    width=3
-                ),
                 mode='lines+markers',
                 line=dict(color=color, width=2),
                 marker=dict(color=color, size=10, symbol='circle'),
@@ -1410,20 +1408,12 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
                 hovertext=hover_texts_orig,
                 hoverinfo='text'
             ))
-        
+            
         # Plot modified results with dashed lines but same color
         if x_positions_mod:
             fig.add_trace(go.Scatter(
                 x=x_positions_mod,
                 y=y_values_mod,
-                error_y=dict(
-                    type='data',
-                    array=y_errors_mod,
-                    visible=True,
-                    color=color,
-                    thickness=1.5,
-                    width=3
-                ),
                 mode='lines+markers',
                 line=dict(color=color, width=2, dash='dash'),
                 marker=dict(color=color, size=10, symbol='square'),
@@ -1469,20 +1459,6 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
         margin=dict(b=100)
     )
     
-    # Add shapes to highlight differences better
-    for i, k in enumerate(top_k_values):
-        color = colors[i % len(colors)]
-        k_data_orig = results[results['top_k'] == k]
-        k_data_mod = results_modified[results_modified['top_k'] == k]
-        
-        for layer in all_layers:
-            matching_orig = k_data_orig[k_data_orig['layer'] == layer]
-            matching_mod = k_data_mod[k_data_mod['layer'] == layer]
-            
-            if not matching_orig.empty and not matching_mod.empty:
-                y_orig = matching_orig['mean_faithfulness'].iloc[0]
-                y_mod = matching_mod['mean_faithfulness'].iloc[0] - baseline
-    
     # Add a note about baseline adjustment if applicable
     if np.abs(baseline) > 1e-3:
         fig.add_annotation(
@@ -1499,16 +1475,8 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
     # Show the figure
     fig.show()
     
-    # Print summary table
-    print("Comparison of Faithfulness by Layer and Top K:")
-    print("-" * 120)
-    orig_label = "Original Mean"
-    mod_label = f"{modified_title} Mean"
-    if np.abs(baseline) > 1e-3:
-        mod_label += f" (Normalized with baseline {baseline})"
-    
-    print(f"{'Layer':<10}{'Top K':<10}{orig_label:<20}{mod_label:<25}{'Difference':<15}{'% Change':<15}")
-    print("-" * 120)
+    # Create a nicely formatted DataFrame for display
+    summary_data = []
     
     for layer in all_layers:
         for k in top_k_values:
@@ -1517,26 +1485,146 @@ def plot_compare_faithfulness_vs_layer_ranges(results, results_modified, modifie
             
             if not orig_rows.empty and not mod_rows.empty:
                 orig_mean = orig_rows['mean_faithfulness'].iloc[0]
+                orig_std = orig_rows.get('std_faithfulness', pd.Series([0])).iloc[0]
+                orig_features = orig_rows['num_selected_features'].iloc[0]
+                
                 mod_raw_mean = mod_rows['mean_faithfulness'].iloc[0]
+                mod_std = mod_rows.get('std_faithfulness', pd.Series([0])).iloc[0]
+                mod_features = mod_rows['num_selected_features'].iloc[0]
+                
                 # Apply the same normalization as in the plot
                 if np.abs(baseline) > 1e-3:
                     mod_adjusted_mean = (mod_raw_mean - baseline) / (1 - baseline)
                 else:
                     mod_adjusted_mean = mod_raw_mean
+                    
                 diff = mod_adjusted_mean - orig_mean
                 pct_change = (diff / orig_mean) * 100 if orig_mean != 0 else float('inf')
                 
-                print(f"{layer:<10}{k:<10}{orig_mean:<20.4f}{mod_adjusted_mean:<25.4f}{diff:<15.4f}{pct_change:<15.2f}%")
+                # Add row to summary data
+                summary_data.append({
+                    'Layer': layer,
+                    'Top K': k,
+                    'Original Mean': orig_mean,
+                    'Original Std': orig_std,
+                    'Original Features': orig_features,
+                    f'{modified_title.title()} Mean': mod_adjusted_mean,
+                    f'{modified_title.title()} Std': mod_std,
+                    f'{modified_title.title()} Features': mod_features,
+                    'Difference': diff,
+                    'Percent Change': f"{pct_change:.2f}%"
+                })
     
-    return fig
+    # Create DataFrame and set display options
+    summary_df = pd.DataFrame(summary_data)
+    
+    # Configure pandas display options for better formatting
+    pd.set_option('display.precision', 4)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    pd.set_option('display.float_format', '{:.4f}'.format)
+    
+    print("\nDetailed Results Summary:")
+    print(summary_df)
+    
+    # Reset pandas display options
+    pd.reset_option('display.precision')
+    pd.reset_option('display.max_columns')
+    pd.reset_option('display.width')
+    pd.reset_option('display.float_format')
 
 
 plot_compare_faithfulness_vs_layer_ranges(standard_results_df, modified_results_df, 
                                           modified_title='14-17 ablated', baseline=0.5662)
 
 
-plot_compare_faithfulness_vs_layer_ranges(standard_results_df, modified_results_df, 
-                                          modified_title='14-17 ablated')
+# ### Plotting histograms of faithfulness scores
+
+# Load the tensors of faithfulness scores for each sample and plot the resulting distribution
+
+layers_to_plot = [
+    # [18, 19, 20, 21, 22, 23, 24, 25],
+    # [18, 19, 20, 21, 22, 23, 24],
+    # [18, 19, 20, 21, 22, 23],
+    # [18, 19, 20, 21, 22],
+    [18, 19, 20, 21],
+    [18, 19, 20],
+    [18, 19],
+    [18]
+]
+top_k_to_plot = [5, 10, 25, 50, 100]
+
+
+import torch
+import plotly.express as px
+import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+for layer_idx, layer in enumerate(layers_to_extract):
+    print(f"\n{'='*80}\nLAYER {layer}\n{'='*80}")
+    
+    for top_k_value in top_k_counts:
+        print(f"\n{'-'*60}\nTop {top_k_value} features\n{'-'*60}")
+
+        # Save the actual faithfulness metrics tensor for potential future analysis
+        metric_load_path = saving_dir / f'faithfulness_metrics_layer_{max(layer)}_topk_{top_k_value}.pt'
+        current_metrics = torch.load(metric_load_path)
+        current_metrics_np = current_metrics.cpu().float().numpy()
+
+        # Filter out inf and nan
+        current_metrics_np = current_metrics_np[np.isfinite(current_metrics_np)]
+
+        print(f"Filtered metrics shape: {current_metrics_np.shape}")
+        print(f"Original metrics shape: {current_metrics.shape}")
+
+        # Calculate mean and std
+        mean = np.mean(current_metrics_np)
+        std = np.std(current_metrics_np)
+
+        # Prepare histogram data
+        nbins = 1000
+        hist_vals, bin_edges = np.histogram(current_metrics_np, bins=nbins)
+        bin_centers = 0.5 * (bin_edges[1:] + bin_edges[:-1])
+
+        # Get histogram height at bin nearest to the mean
+        mean_bin_idx = np.argmin(np.abs(bin_centers - mean))
+        target_peak_height = hist_vals[mean_bin_idx]
+
+        # Create dataframe for Plotly histogram
+        df = pd.DataFrame({'Faithfulness Score': current_metrics_np})
+        hist_fig = px.histogram(
+            df,
+            x='Faithfulness Score',
+            nbins=nbins,
+            title=f"Faithfulness metrics (Layer_{max(layer)}, topk_{top_k_value})\nMean: {mean:.4f}, Std: {std:.4f}",
+            opacity=0.75
+        )
+
+        # Generate Gaussian curve
+        x_range = np.linspace(min(current_metrics_np), max(current_metrics_np), 500)
+        y_vals = norm.pdf(x_range, mean, std)
+
+        # Scale Gaussian to match the histogram peak height
+        y_vals_scaled = y_vals / y_vals.max() * target_peak_height
+
+        # Add line plot of Gaussian
+        hist_fig.add_trace(go.Scatter(
+            x=x_range,
+            y=y_vals_scaled,
+            mode='lines',
+            name='Gaussian Fit',
+            line=dict(color='red')
+        ))
+
+        hist_fig.show()
+
+        del current_metrics
+        clear_cache()
+
+
+
 
 
 
