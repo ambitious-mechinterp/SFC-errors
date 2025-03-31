@@ -4,7 +4,8 @@
 # But allow SFC datasets (they are very light anyway)
 !/data/rc_train_filtered.json
 !/data/rc_test.json
-
+!/data/rc_train_processed.csv
+!/data/rc_test_processed.csv
 # Mac OS-specific storage files
 .DS_Store
 
