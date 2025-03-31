@@ -33,11 +33,13 @@ def process_data_in_batches(rc_data: pd.DataFrame, model, tokenizer, batch_size:
     # Add columns to store results
     result_columns = [
         'clean_answer_logits', 'clean_answer_probs', 'clean_answer_rank',
-        'clean_be_conjugations_rank', 'clean_be_conjugations_logits_diff',
+        'clean_answer_logits_diff', 'clean_answer_probs_diff',
+        'clean_be_conjugations_logits', 'clean_be_conjugations_rank', 'clean_be_conjugations_logits_diff',
         'clean_be_conjugations_probs', 'clean_be_conjugations_probs_diff',
         'patch_answer_logits', 'patch_answer_probs', 'patch_answer_rank',
-        'patch_be_conjugations_rank', 'patch_be_conjugations_logits_diff',
-        'patch_be_conjugations_probs', 'patch_be_conjugations_probs_diff'
+        'patch_answer_logits_diff', 'patch_answer_probs_diff',
+        'patch_be_conjugations_logits', 'patch_be_conjugations_rank', 'patch_be_conjugations_logits_diff',
+        'patch_be_conjugations_probs', 'patch_be_conjugations_probs_diff',
     ]
     
     for col in result_columns:
@@ -81,8 +83,12 @@ def process_data_in_batches(rc_data: pd.DataFrame, model, tokenizer, batch_size:
         for i, idx in enumerate(range(start_idx, end_idx)):
             # Clean metrics
             result_df.at[idx, 'clean_answer_logits'] = clean_logits[i, clean_answers[i]].item()
+            result_df.at[idx, 'clean_answer_logits_diff'] = clean_logits[i, clean_answers[i]] - clean_logits[i, patch_answers[i]]
             result_df.at[idx, 'clean_answer_probs'] = clean_probs[i, clean_answers[i]].item()
+            result_df.at[idx, 'clean_answer_probs_diff'] = clean_probs[i, clean_answers[i]] - clean_probs[i, patch_answers[i]]
             result_df.at[idx, 'clean_answer_rank'] = t.where(clean_logits_rank[i] == clean_answers[i])[0].item()
+
+            result_df.at[idx, 'clean_be_conjugations_logits'] = clean_logits[i, be_conjugations_clean_toks[i]].item()
             result_df.at[idx, 'clean_be_conjugations_rank'] = t.where(clean_logits_rank[i] == be_conjugations_clean_toks[i])[0].item()
             result_df.at[idx, 'clean_be_conjugations_logits_diff'] = (
                 clean_logits[i, be_conjugations_clean_toks[i]] - 
@@ -94,13 +100,18 @@ def process_data_in_batches(rc_data: pd.DataFrame, model, tokenizer, batch_size:
             
             # Patch metrics
             result_df.at[idx, 'patch_answer_logits'] = patch_logits[i, patch_answers[i]].item()
+            result_df.at[idx, 'patch_answer_logits_diff'] = patch_logits[i, patch_answers[i]] - patch_logits[i, clean_answers[i]]
             result_df.at[idx, 'patch_answer_probs'] = patch_probs[i, patch_answers[i]].item()
+            result_df.at[idx, 'patch_answer_probs_diff'] = patch_probs[i, patch_answers[i]] - patch_probs[i, clean_answers[i]]
             result_df.at[idx, 'patch_answer_rank'] = t.where(patch_logits_rank[i] == patch_answers[i])[0].item()
+
+            result_df.at[idx, 'patch_be_conjugations_logits'] = patch_logits[i, be_conjugations_patch_toks[i]].item()
+            result_df.at[idx, 'patch_be_conjugations_probs'] = patch_probs[i, be_conjugations_patch_toks[i]].item()
             result_df.at[idx, 'patch_be_conjugations_rank'] = t.where(patch_logits_rank[i] == be_conjugations_patch_toks[i])[0].item()
             result_df.at[idx, 'patch_be_conjugations_logits_diff'] = (
                 patch_logits[i, be_conjugations_patch_toks[i]] - 
                 patch_logits[i, be_conjugations_clean_toks[i]]).item()
-            result_df.at[idx, 'patch_be_conjugations_probs'] = patch_probs[i, be_conjugations_patch_toks[i]].item()
+            
             result_df.at[idx, 'patch_be_conjugations_probs_diff'] = (
                 patch_probs[i, be_conjugations_patch_toks[i]] - 
                 patch_probs[i, be_conjugations_clean_toks[i]]).item()
