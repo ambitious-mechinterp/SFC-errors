@@ -11,9 +11,20 @@ class SpecialTokens(Enum):
 
 # Enum to define dataset categories
 class DatasetCategory(Enum):
-    QA = "qa"
-    AGREEMENT = "agreement"
-    TRUE_FALSE = "true_false"
+    QA = ("qa", True)
+    AGREEMENT = ("agreement", True)
+    AGREEMENT_BE = ("agreement_be", True)
+    TRUE_FALSE = ("true_false", True)
+    
+    def __init__(self, value, requires_padding):
+        # We use the first element as the value
+        self._value_ = value
+        # Store requires_padding as a separate attribute
+        self._requires_padding = requires_padding
+    
+    @property
+    def requires_padding(self):
+        return self._requires_padding
 
 # Refactored enum listing supported datasets with categories
 class SupportedDatasets(Enum):
@@ -21,15 +32,22 @@ class SupportedDatasets(Enum):
     COMMONSENSE_QA_FILTERED = ("drsis/deception-commonsense_qa_wo_chat", DatasetCategory.QA)
     VERB_AGREEMENT = ('rc_train_filtered.json', DatasetCategory.AGREEMENT)
     VERB_AGREEMENT_TEST = ('rc_test.json', DatasetCategory.AGREEMENT)
+    VERB_AGREEMENT_BE = ('rc_train_processed.csv', DatasetCategory.AGREEMENT_BE)
+    VERB_AGREEMENT_TEST_BE = ('rc_test_processed.csv', DatasetCategory.AGREEMENT_BE)
     CITIES = ('cities_true_false.json', DatasetCategory.TRUE_FALSE)
     COMPANIES = ('companies_true_false.json', DatasetCategory.TRUE_FALSE)
     FACTS = ('facts_true_false.json', DatasetCategory.TRUE_FALSE)
     
     def __init__(self, path, category):
-        self.path = path
-        self.category = category
+        # We use the path as the value
+        self._value_ = path
+        # Store category as a separate attribute
+        self._category = category
     
     @property
-    def value(self):
-        # For backward compatibility with existing code that expects value to be the path
-        return self.path
+    def path(self):
+        return self._value_
+    
+    @property
+    def category(self):
+        return self._category

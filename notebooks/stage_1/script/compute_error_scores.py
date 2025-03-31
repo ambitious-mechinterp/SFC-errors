@@ -107,7 +107,7 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_BE
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model,
                               local_dataset=True, base_folder_path=datapath)
@@ -124,23 +124,60 @@ N_CONTEXT = clean_dataset['prompt'].shape[1]
 CONTROL_SEQ_LEN, N_CONTEXT
 
 
+# New sanity check: make sure that 
+prompts = clean_dataset['prompt']
+
+# Find indices where the last position is not 0
+non_padded_indices = []
+
+for i in range(len(prompts)):
+    if prompts[i, -1] != 0:
+        non_padded_indices.append(i)
+
+print(f"Found {len(non_padded_indices)} prompts without padding in the last position.")
+print(f"Indices: {non_padded_indices}")
+
+# If any were found, let's examine a few examples
+if non_padded_indices:
+    print("\nExamples of prompts without padding at the end:")
+    for idx in non_padded_indices[:5]:  # Show up to 5 examples
+        print(f"Index {idx}: {prompts[idx]}")
+
+# Let's also check if there are any prompts with different lengths
+lengths = [len(torch.nonzero(p != 0)) for p in prompts]
+unique_lengths = set(lengths)
+print(f"\nUnique prompt lengths (excluding padding): {sorted(unique_lengths)}")
+
+if len(unique_lengths) > 1:
+    print("\nExamples of different length prompts:")
+    for length in sorted(unique_lengths):
+        indices = [i for i, l in enumerate(lengths) if l == length]
+        if indices:
+            print(f"\nLength {length} (index {indices[0]}):")
+            print(prompts[indices[0]])
+
+
 print('Clean dataset:')
-for prompt in clean_dataset['prompt'][:3]:
+for k, prompt in enumerate(clean_dataset['prompt'][:3]):
   print("\nPrompt:", model.to_string(prompt), end='\n\n')
 
   for i, tok in enumerate(prompt):
     str_token = model.to_string(tok)
     print(f"({i-CONTROL_SEQ_LEN}, {str_token})", end=' ')
-  print()
 
-print('Corrupted dataset:')
+  answer_str_token = model.to_string(clean_dataset['answer'][k])
+  print(f'({i-CONTROL_SEQ_LEN+1}, {answer_str_token})')
+
+print('\n\nCorrupted dataset:')
 for prompt in corrupted_dataset['prompt'][:3]:
   print("\nPrompt:", model.to_string(prompt), end='\n\n')
   
   for i, tok in enumerate(prompt):
     str_token = model.to_string(tok)
     print(f"({i-CONTROL_SEQ_LEN}, {str_token})", end=' ')
-  print()
+      
+  answer_str_token = model.to_string(corrupted_dataset['answer'][k])
+  print(f'({i-CONTROL_SEQ_LEN+1}, {answer_str_token})')
 
 
 # Sanity checks
@@ -170,7 +207,6 @@ if RUN_WITH_SAES:
 else:
     caching_device = "cuda:0"
 
-
 caching_device
 
 
@@ -178,7 +214,7 @@ caching_device
 # - Loads a Gemma model and its Gemma Scope SAEs (either attaching them to the model or not)
 # - Provides interface methods to compute SFC scores (currently, only attr patching is supported) on an arbitrary dataset (that follows the format of my SFCDatasetLoader class from above)
 
-EXPERIMENT = 'sva_rc'
+EXPERIMENT = 'sva_rc_be'
 
 clear_cache()
 
@@ -301,7 +337,7 @@ datapath
 # Load all of our computed SFC scores and caches:
 
 from classes.sfc_node_scores import SFC_NodeScores
-EXPERIMENT = 'sva_rc'
+EXPERIMENT = 'sva_rc_be'
 
 sfc_scores = SFC_NodeScores(
     device=device,

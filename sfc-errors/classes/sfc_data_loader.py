@@ -55,6 +55,16 @@ class SFCDatasetLoader:
     #         return 180
 
     def filter_and_set_max_length(self, apply_chat_template=True, prepend_generation_prefix=False):
+        """
+        Calculate optimal padding length and filter outlier-length prompts if necessary.
+        If all prompts have the same length, no filtering is applied.
+        """
+        # Check if the dataset category requires padding
+        if not self.dataset_name.category.requires_padding:
+            print(f"Dataset category {self.dataset_name.category.name} doesn't require padding. Skipping max length calculation.")
+            self._max_prompt_length = None
+            return None
+        
         def get_tokenized_length(prompt):
             tokenizer = self.model.tokenizer
 
@@ -103,6 +113,42 @@ class SFCDatasetLoader:
         corrupted_prompts_lengths = torch.tensor([get_tokenized_length(prompt) for prompt in corrupted_prompts])
         prompts_count = clean_prompts_lengths.size(0)
 
+        # Check for unique lengths
+        unique_clean_lengths = torch.unique(clean_prompts_lengths)
+        unique_corrupted_lengths = torch.unique(corrupted_prompts_lengths)
+        
+        # Check if all prompts have the same length
+        if len(unique_clean_lengths) == 1 and len(unique_corrupted_lengths) == 1:
+            # All clean prompts have one length, all corrupted prompts have one length
+            clean_length = unique_clean_lengths.item()
+            corrupted_length = unique_corrupted_lengths.item()
+            print(f"All prompts have uniform lengths. Clean: {clean_length}, Corrupted: {corrupted_length}")
+            self._max_prompt_length = max(clean_length, corrupted_length)
+            print(f'Setting max prompt length to {self._max_prompt_length}')
+            return self._max_prompt_length
+        
+        # If we get here, there is actual variation in prompt lengths
+        clean_min = clean_prompts_lengths.min().item()
+        clean_max = clean_prompts_lengths.max().item()
+        corrupted_min = corrupted_prompts_lengths.min().item()
+        corrupted_max = corrupted_prompts_lengths.max().item()
+        
+        print(f"Found variation in prompt lengths. Clean: {clean_min}-{clean_max} ({len(unique_clean_lengths)} unique lengths)")
+        print(f"Corrupted: {corrupted_min}-{corrupted_max} ({len(unique_corrupted_lengths)} unique lengths)")
+        
+        # Check if the variation is minimal (e.g., only a few outliers)
+        # Calculate how many prompts have the most common length
+        clean_mode = torch.mode(clean_prompts_lengths).values.item()
+        clean_mode_count = (clean_prompts_lengths == clean_mode).sum().item()
+        clean_pct_mode = (clean_mode_count / len(clean_prompts_lengths)) * 100
+        
+        corrupted_mode = torch.mode(corrupted_prompts_lengths).values.item()
+        corrupted_mode_count = (corrupted_prompts_lengths == corrupted_mode).sum().item()
+        corrupted_pct_mode = (corrupted_mode_count / len(corrupted_prompts_lengths)) * 100
+        
+        print(f"Clean: Most common length is {clean_mode} ({clean_pct_mode:.1f}% of prompts)")
+        print(f"Corrupted: Most common length is {corrupted_mode} ({corrupted_pct_mode:.1f}% of prompts)")
+        
         # Step 2: Calculate the length threshold for the top 1% longest entries
         clean_threshold_length = torch.quantile(clean_prompts_lengths.float(), 0.99).item()
         corrupted_threshold_length = torch.quantile(corrupted_prompts_lengths.float(), 0.99).item()
@@ -187,6 +233,14 @@ class SFCDatasetLoader:
         # if not isinstance(dataset_name, SupportedDatasets):
         #     raise ValueError(f"{dataset_name} is not a supported dataset. Choose from {list(SupportedDatasets)}")
 
+        # handle CSV files
+        if dataset_name.category == DatasetCategory.AGREEMENT_BE:
+            if local_dataset:
+                local_dataset_path = str(base_folder_path / dataset_name.value)
+                return load_dataset('csv', data_files=local_dataset_path, split='train')
+            else:
+                raise ValueError(f"CSV datasets must be loaded locally. Set local_dataset=True.")
+
         if local_dataset:
             local_dataset_name = str(base_folder_path / dataset_name.value)
             return load_dataset('json', data_files=local_dataset_name, split='train')
@@ -199,7 +253,6 @@ class SFCDatasetLoader:
     
     def apply_chat_template_and_tokenize(self, prompt, tokenize=True, apply_chat_template=True, prepend_generation_prefix=False):
         tokenizer = self.model.tokenizer
-        max_length = self._max_prompt_length
         special_token_mask = None
 
         # Apply chat template if required
@@ -215,35 +268,39 @@ class SFCDatasetLoader:
                 add_generation_prompt = prepend_generation_prefix
             )
         
-        # Apply padding when manually tokenizing
+        # Apply padding when manually tokenizing if needed
         if tokenize:
+            # Check if the dataset category requires padding
+            padding_strategy = 'max_length' if self.dataset_name.category.requires_padding else 'longest'
+            max_length = self._max_prompt_length if self.dataset_name.category.requires_padding else None
+            
             if apply_chat_template:
-                # Tokenize using the tokenizer with padding and truncation
+                # Tokenize using the tokenizer with appropriate padding strategy
                 tokenized = tokenizer(
                     prompt, 
                     return_tensors='pt',
                     add_special_tokens=False,
-                    padding='max_length',        # Pad to max_length
-                    truncation=True,             # Truncate to max_length
+                    padding=padding_strategy,
+                    truncation=True if max_length else False,
                     max_length=max_length,
                     return_special_tokens_mask=False
                 )
                 tokenized['input_ids'] = tokenized['input_ids'].to(self.device).squeeze(0)
                 tokenized['special_tokens_mask'] = self.get_special_tokens_mask(tokenized['input_ids'])
             else:
-                # Tokenize using the tokenizer with padding and truncation, and add special tokens
+                # Tokenize using the tokenizer with appropriate padding strategy, and add special tokens
                 tokenized = tokenizer(
                     prompt, 
                     return_tensors='pt',
                     add_special_tokens=True,
-                    padding='max_length',        # Pad to max_length
-                    truncation=True,             # Truncate to max_length
+                    padding=padding_strategy,
+                    truncation=True if max_length else False,
                     max_length=max_length,
                     return_special_tokens_mask=True
                 )
                 
-            prompt = tokenized["input_ids"].to(self.device).squeeze(0)  # Padded input IDs
-            special_token_mask = tokenized["special_tokens_mask"].squeeze(0).to(self.device)  # Mask for special tokens
+            prompt = tokenized["input_ids"].to(self.device).squeeze(0)
+            special_token_mask = tokenized["special_tokens_mask"].squeeze(0).to(self.device)
 
         return prompt, special_token_mask
 
@@ -261,7 +318,7 @@ class SFCDatasetLoader:
                 f'\n{task_prompt}'
             )
             return prompt
-        elif self.dataset_name.category == DatasetCategory.AGREEMENT:
+        elif self.dataset_name.category in [DatasetCategory.AGREEMENT, DatasetCategory.AGREEMENT_BE]:
             if not patched:
                 return item['clean_prefix']
             else:
@@ -284,6 +341,8 @@ class SFCDatasetLoader:
             answer = item['answerKey']
         elif self.dataset_name.category == DatasetCategory.AGREEMENT:
             answer = item['clean_answer']
+        elif self.dataset_name.category == DatasetCategory.AGREEMENT_BE:
+            answer = item['be_conjugations_clean']
         elif self.dataset_name.category == DatasetCategory.TRUE_FALSE:
             answer = str(item['label'])
         else:
@@ -308,6 +367,8 @@ class SFCDatasetLoader:
             answer = [option for option in ['A', 'B', 'C', 'D', 'E'] if option != correct_answer]
         elif self.dataset_name.category == DatasetCategory.AGREEMENT:
             answer = item['patch_answer']
+        elif self.dataset_name.category == DatasetCategory.AGREEMENT_BE:
+            answer = item['be_conjugations_patch']
         elif self.dataset_name.category == DatasetCategory.TRUE_FALSE:
             answer = str(not item['label'])
         else:
@@ -329,17 +390,30 @@ class SFCDatasetLoader:
         return answer, answer_pos
 
     def get_masks(self, special_token_mask):
-        first_non_special_token_idx = torch.nonzero(special_token_mask == 0, as_tuple=False)[0].item()
+        # Find the first non-special token index
+        non_special_indices = torch.nonzero(special_token_mask == 0, as_tuple=False)
+        if len(non_special_indices) > 0:
+            first_non_special_token_idx = non_special_indices[0].item()
+        else:
+            # If no non-special tokens found, use the first token
+            first_non_special_token_idx = 0
+        
         control_sequence_length = first_non_special_token_idx + 1
 
+        # Create attention mask (1 for tokens to attend to, 0 for padding tokens)
         attention_mask = torch.ones_like(special_token_mask)
+        
+        # Try to find padding tokens from the end
         reversed_special_mask = torch.flip(special_token_mask, [0])
-
-        first_padding_pos_reversed = torch.nonzero(reversed_special_mask == 0, as_tuple=False)[0].item() - 1
-        first_padding_pos = len(special_token_mask) - 1 - first_padding_pos_reversed
-
-        attention_mask[first_padding_pos:] = 0
-
+        reversed_indices = torch.nonzero(reversed_special_mask == 0, as_tuple=False)
+        
+        if len(reversed_indices) > 0:
+            # Found non-special tokens from the end
+            first_padding_pos_reversed = reversed_indices[0].item() - 1
+            if first_padding_pos_reversed >= 0:  # Ensure it's a valid position
+                first_padding_pos = len(special_token_mask) - 1 - first_padding_pos_reversed
+                attention_mask[first_padding_pos:] = 0
+        
         return control_sequence_length, attention_mask
             
     def get_clean_sample(self, item, tokenize, apply_chat_template, prepend_generation_prefix=False):
@@ -403,9 +477,15 @@ class SFCDatasetLoader:
     def get_clean_corrupted_datasets(self, tokenize=True, apply_chat_template=True, prepend_generation_prefix=False, pt=True):
         """
         Refactored method to return PyTorch tensors if the 'pt' parameter is set to True (default).
+        For categories that require padding (QA, TRUE_FALSE), computes optimal padding.
+        For categories with constant lengths (AGREEMENT, AGREEMENT_BE), no padding is applied.
+        Always returns a consistent set of fields regardless of dataset category.
         """
-        print('Figuring out optimal padding length...')
-        self.filter_and_set_max_length(apply_chat_template=apply_chat_template, prepend_generation_prefix=prepend_generation_prefix)
+        if self.dataset_name.category.requires_padding:
+            print('Figuring out optimal padding length...')
+            self.filter_and_set_max_length(apply_chat_template=apply_chat_template, prepend_generation_prefix=prepend_generation_prefix)
+        else:
+            print(f'Dataset {self.dataset_name} has constant length prompts. Skipping padding calculation.')
 
         clean_samples = []
         corrupted_samples = []
@@ -432,15 +512,18 @@ class SFCDatasetLoader:
             "answer_pos": [entry["answer_pos"] for entry in corrupted_samples]
         }
 
+        # Add special_token_mask if tokenization was applied
         if tokenize:
-            clean_hf_dict["special_token_mask"] = [entry["special_token_mask"] for entry in clean_samples]
-            corrupted_hf_dict["special_token_mask"] = [entry["special_token_mask"] for entry in corrupted_samples]
+            clean_hf_dict["special_token_mask"] = [entry.get("special_token_mask", torch.zeros_like(entry["prompt"], device=self.device)) for entry in clean_samples]
+            corrupted_hf_dict["special_token_mask"] = [entry.get("special_token_mask", torch.zeros_like(entry["prompt"], device=self.device)) for entry in corrupted_samples]
 
-            clean_hf_dict["control_sequence_length"] = [entry["control_sequence_length"] for entry in clean_samples]
-            corrupted_hf_dict["control_sequence_length"] = [entry["control_sequence_length"] for entry in corrupted_samples]
-
-            clean_hf_dict["attention_mask"] = [entry["attention_mask"] for entry in clean_samples]
-            corrupted_hf_dict["attention_mask"] = [entry["attention_mask"] for entry in corrupted_samples]
+            # Add control_sequence_length with default of 0 if not present
+            clean_hf_dict["control_sequence_length"] = [entry.get("control_sequence_length", 0) for entry in clean_samples]
+            corrupted_hf_dict["control_sequence_length"] = [entry.get("control_sequence_length", 0) for entry in corrupted_samples]
+            
+            # Add attention_mask with default of all 1s if not present
+            clean_hf_dict["attention_mask"] = [entry.get("attention_mask", torch.ones_like(entry["prompt"], device=self.device)) for entry in clean_samples]
+            corrupted_hf_dict["attention_mask"] = [entry.get("attention_mask", torch.ones_like(entry["prompt"], device=self.device)) for entry in corrupted_samples]
 
         if pt:
             for dataset_dict in [clean_hf_dict, corrupted_hf_dict]:
