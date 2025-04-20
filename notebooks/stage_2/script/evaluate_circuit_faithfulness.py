@@ -121,7 +121,7 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST_BE
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model, num_samples=10000,
                               local_dataset=True, base_folder_path=datapath)
@@ -221,7 +221,7 @@ circuit_evaluator = CircuitEvaluator(sfc_model)
 import numpy as np
 
 batch_size = 1024
-total_batches = 1
+total_batches = None
 total_thresholds = 20
 
 # Define threshold range (logarithmic scale) for SFC scores, which controls the number of nodes in the circuit
@@ -264,7 +264,8 @@ for i, threshold in enumerate(thresholds):
         node_threshold=threshold,
         batch_size=batch_size,
         total_batches=total_batches,
-        verbose = i == 0 # log only for the first batch
+        verbose = i == 0, # log only for the first batch
+        return_all_metrics = True
     )
     
     # Calculate average faithfulness and standard deviation
@@ -313,7 +314,8 @@ for i, threshold in enumerate(thresholds):
         nodes_to_always_ablate=always_ablate_fn,
         batch_size=batch_size,
         total_batches=total_batches,
-        verbose = i == 0 # log only for the first batch
+        verbose = i == 0, # log only for the first batch
+        return_all_metrics = True
     )
     
     # Calculate average faithfulness and standard deviation
@@ -360,7 +362,8 @@ for i, threshold in enumerate(thresholds):
         nodes_to_always_ablate=always_ablate_fn,
         batch_size=batch_size,
         total_batches=total_batches,
-        verbose = i == 0 # log only for the first batch
+        verbose = i == 0, # log only for the first batch
+        return_all_metrics = True
     )
     
     # Calculate average faithfulness and standard deviation
@@ -475,7 +478,7 @@ datapath
 
 
 # Load the CSV files with our metrics
-EXPERIMENT = 'sva_rc_test'
+EXPERIMENT = 'sva_rc_be'
 
 standard_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval.csv")
 resid_errors_ablated_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval_resid_err_abl.csv")

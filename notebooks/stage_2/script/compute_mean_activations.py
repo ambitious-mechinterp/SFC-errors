@@ -107,7 +107,7 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_BE
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model,
                               local_dataset=True, base_folder_path=datapath)
@@ -178,7 +178,7 @@ caching_device
 # - Loads a Gemma model and its Gemma Scope SAEs (either attaching them to the model or not)
 # - Provides interface methods to compute SFC scores (currently, only attr patching is supported) on an arbitrary dataset (that follows the format of my SFCDatasetLoader class from above)
 
-EXPERIMENT = 'sva_rc'
+EXPERIMENT = 'sva_rc_be'
 
 clear_cache()
 sfc_model = SFC_Gemma(model, params_count=PARAMS_COUNT, control_seq_len=CONTROL_SEQ_LEN, 
@@ -312,7 +312,7 @@ datapath
 # Load all of our computed SFC scores and caches:
 
 from classes.sfc_node_scores import SFC_NodeScores
-EXPERIMENT = 'sva_rc'
+EXPERIMENT = 'sva_rc_be'
 
 sfc_scores = SFC_NodeScores(
     device=device,

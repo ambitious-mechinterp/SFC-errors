@@ -121,15 +121,15 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST_BE
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model, num_samples=10000,
                               local_dataset=True, base_folder_path=datapath)
 
-EXPERIMENT = 'sva_rc_test'
+EXPERIMENT = 'sva_rc_be'
 saving_dir = datapath / EXPERIMENT
 
-print(f'Using {SupportedDatasets.VERB_AGREEMENT_TEST} dataset and saving to the dir data/{EXPERIMENT}.')
+print(f'Using {DATASET_NAME} dataset and saving to the dir data/{EXPERIMENT}.')
 
 
 clean_dataset, corrupted_dataset = dataloader.get_clean_corrupted_datasets(tokenize=True, apply_chat_template=False, prepend_generation_prefix=True)
