@@ -32,7 +32,8 @@ dependencies:
   - huggingface-hub[cli]
   - plotly 
   - jaxtyping
-  - sae_lens # this will also install transformer_lens
+  - sae_lens
+  - transformer-lens==2.9.0
   - nnsight
   - graphviz
 prefix: /home/taras/.conda/envs/taras_ami

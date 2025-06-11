@@ -3,6 +3,8 @@ from utils.enums import SpecialTokens, SupportedDatasets, DatasetCategory
 import torch
 import random
 from tqdm import tqdm
+import os
+from pathlib import Path
 
 ### Utility functions ###
 def find_first_index(tensor: torch.Tensor, value) -> int:
@@ -25,6 +27,7 @@ class SFCDatasetLoader:
                  num_samples=None, local_dataset=False, base_folder_path='./data'):
         self.dataset = self.load_supported_dataset(dataset_name, split, local_dataset, base_folder_path)
         self.dataset_name = dataset_name
+        self.base_folder_path = base_folder_path
 
         self.task_prompt = task_prompt
         self.clean_system_prompt = clean_system_prompt
@@ -45,19 +48,45 @@ class SFCDatasetLoader:
         if num_samples is not None and num_samples < len(self.dataset):
             self.dataset = self.dataset.select(random.sample(range(len(self.dataset)), num_samples))
 
-    # Old & awful version of setting max prompt length
-    # def _get_max_prompt_length(self):
-    #     if self.dataset_name in [SupportedDatasets.COMMONSENSE_QA, SupportedDatasets.COMMONSENSE_QA_FILTERED]:
-    #         return 180
-    #     elif self.dataset_name == SupportedDatasets.VERB_AGREEMENT:
-    #         return 30
-    #     elif self.dataset_name in [SupportedDatasets.CITIES, SupportedDatasets.COMPANIES, SupportedDatasets.FACTS]:
-    #         return 180
-
-    def filter_and_set_max_length(self, apply_chat_template=True, prepend_generation_prefix=False):
+    def save_subset_by_indices(self, indices: list, filename_suffix: str):
         """
-        Calculate optimal padding length and filter outlier-length prompts if necessary.
+        Selects a subset of the original dataset by indices and saves it to a new JSON file.
+
+        Args:
+            indices (list): A list of integer indices to select from the original dataset.
+            filename_suffix (str): A descriptive suffix to append to the output filename.
+                                   (e.g., "_mm_gt_1" will result in a file like '..._mm_gt_1.json')
+        """
+        if not isinstance(indices, list):
+            indices = list(indices)
+            
+        print(f"Selecting {len(indices)} samples from the original dataset...")
+        subset_dataset = self.dataset.select(indices)
+
+        # Construct the output file path
+        file_name_prefix = self.dataset_name.value.replace('/', '_')
+        file_name = f"{file_name_prefix}{filename_suffix}.json"
+        
+        # Use pathlib for robust path creation
+        output_path = Path(self.base_folder_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        full_path = output_path / file_name
+
+        # Save the subset to the new JSON file
+        print(f"Saving filtered dataset with {len(subset_dataset)} samples to: {full_path}")
+        subset_dataset.to_json(full_path)
+        print("Save complete.")
+
+    def filter_and_set_max_length(self, apply_chat_template=True, prepend_generation_prefix=False, filter_long_sequences=True, use_most_common_length=False):
+        """
+        Calculate optimal padding length and optionally filter outlier-length prompts.
         If all prompts have the same length, no filtering is applied.
+        
+        Args:
+            apply_chat_template (bool): Whether to apply chat template when calculating lengths
+            prepend_generation_prefix (bool): Whether to prepend generation prefix
+            filter_long_sequences (bool): Whether to filter out sequences longer than 99th percentile
+            use_most_common_length (bool): Whether to filter to only the most common prompt length
         """
         # Check if the dataset category requires padding
         if not self.dataset_name.category.requires_padding:
@@ -149,22 +178,38 @@ class SFCDatasetLoader:
         print(f"Clean: Most common length is {clean_mode} ({clean_pct_mode:.1f}% of prompts)")
         print(f"Corrupted: Most common length is {corrupted_mode} ({corrupted_pct_mode:.1f}% of prompts)")
         
-        # Step 2: Calculate the length threshold for the top 1% longest entries
-        clean_threshold_length = torch.quantile(clean_prompts_lengths.float(), 0.99).item()
-        corrupted_threshold_length = torch.quantile(corrupted_prompts_lengths.float(), 0.99).item()
-        length_threshold = max(clean_threshold_length, corrupted_threshold_length)
+        if use_most_common_length:
+            filtered_indices = [i for i in range(prompts_count) if clean_prompts_lengths[i] == clean_mode and corrupted_prompts_lengths[i] == corrupted_mode]
+            
+            if not filtered_indices:
+                print("Warning: No prompts found with the most common length for both clean and corrupted versions. No filtering applied.")
+                length_threshold = max(clean_prompts_lengths.max().item(), corrupted_prompts_lengths.max().item())
+            else:
+                self.dataset = self.dataset.select(filtered_indices)
+                num_filtered = prompts_count - len(filtered_indices)
+                print(f"Filtered dataset to most common prompt lengths. Removed {num_filtered} of {prompts_count} prompts.")
+                length_threshold = max(clean_mode, corrupted_mode)
+
+        elif filter_long_sequences:
+            # Step 2: Calculate the length threshold for the top 1% longest entries
+            clean_threshold_length = torch.quantile(clean_prompts_lengths.float(), 0.99).item()
+            corrupted_threshold_length = torch.quantile(corrupted_prompts_lengths.float(), 0.99).item()
+            length_threshold = max(clean_threshold_length, corrupted_threshold_length)
         
-        # Step 3: Filter out entries where length is greater than or equal to the threshold
-        filtered_indices_clean = [i for i, length in enumerate(clean_prompts_lengths) if length < clean_threshold_length]
-        filtered_indices_corrupted = [i for i, length in enumerate(corrupted_prompts_lengths) if length < corrupted_threshold_length]
-        filtered_indices = list(set(filtered_indices_clean).intersection(filtered_indices_corrupted))
+            # Step 3: Filter out entries where length is greater than or equal to the threshold
+            filtered_indices_clean = [i for i, length in enumerate(clean_prompts_lengths) if length < clean_threshold_length]
+            filtered_indices_corrupted = [i for i, length in enumerate(corrupted_prompts_lengths) if length < corrupted_threshold_length]
+            filtered_indices = list(set(filtered_indices_clean).intersection(filtered_indices_corrupted))
 
-        filtered_dataset = self.dataset.select(filtered_indices)
-        self.dataset = filtered_dataset
+            filtered_dataset = self.dataset.select(filtered_indices)
+            self.dataset = filtered_dataset
 
-        # Print the number of filtered elements
-        num_filtered = prompts_count - len(filtered_indices)
-        print(f"Filtered out {num_filtered} longest prompts from a total of {prompts_count} prompts.")
+            # Print the number of filtered elements
+            num_filtered = prompts_count - len(filtered_indices)
+            print(f"Filtered out {num_filtered} longest prompts from a total of {prompts_count} prompts.")
+        else:
+            print("Skipping sequence length filtering. Using max prompt length for padding.")
+            length_threshold = max(clean_prompts_lengths.max().item(), corrupted_prompts_lengths.max().item())
 
         self._max_prompt_length = int(length_threshold)
         print(f'Setting max prompt length to {self._max_prompt_length}')
@@ -474,16 +519,236 @@ class SFCDatasetLoader:
 
         return result_dict
 
-    def get_clean_corrupted_datasets(self, tokenize=True, apply_chat_template=True, prepend_generation_prefix=False, pt=True):
+    def get_single_dataset(self, tokenize=True, apply_chat_template=True, prepend_generation_prefix=False, pt=True):
+        """
+        Processes datasets of format {"prompt": "...", "true_answer": "...", "false_answer": "..."}.
+        This method is designed for datasets that do not have a clean/corrupted split.
+
+        Args:
+            tokenize (bool): Whether to tokenize the prompts.
+            apply_chat_template (bool): Whether to apply chat template.
+            prepend_generation_prefix (bool): Whether to prepend generation prefix.
+            pt (bool): Whether to return PyTorch tensors (True) or a HuggingFace dataset (False).
+        """
+        if self.dataset_name.category.value != DatasetCategory.PLAIN_PROMPT.value:
+            raise ValueError(f"This method is only for PLAIN_PROMPT category datasets, but got {self.dataset_name.category}")
+
+        if self.dataset_name.category.requires_padding:
+            print('Figuring out optimal padding length...')
+            self.filter_and_set_max_length(apply_chat_template=apply_chat_template,
+                                           prepend_generation_prefix=prepend_generation_prefix)
+        else:
+            print(f'Dataset {self.dataset_name} has constant length prompts. Skipping padding calculation.')
+
+        samples = []
+        for item in tqdm(self.dataset):
+            prompt_text = item['prompt']
+            prompt, special_token_mask = self.apply_chat_template_and_tokenize(
+                prompt_text,
+                tokenize=tokenize,
+                apply_chat_template=apply_chat_template,
+                prepend_generation_prefix=prepend_generation_prefix
+            )
+
+            true_answer_text = item['true_answer']
+            false_answer_text = item['false_answer']
+
+            try:
+                answer_pos = find_first_index(prompt, self.model.tokenizer.pad_token_id) - 1
+            except ValueError:
+                answer_pos = prompt.shape[0] - 1
+
+            true_answer = true_answer_text
+            false_answer = false_answer_text
+            if tokenize:
+                true_answer = self.model.to_single_token(true_answer_text)
+                false_answer = self.model.to_single_token(false_answer_text)
+
+            sample = {
+                "prompt": prompt,
+                "true_answer": true_answer,
+                "false_answer": false_answer,
+                "answer_pos": answer_pos,
+            }
+
+            if tokenize:
+                sample["special_token_mask"] = special_token_mask
+                control_sequence_length, attention_mask = self.get_masks(special_token_mask)
+                sample["control_sequence_length"] = control_sequence_length
+                sample["attention_mask"] = attention_mask
+
+            samples.append(sample)
+
+        hf_dict = {
+            "prompt": [entry["prompt"] for entry in samples],
+            "true_answer": [entry["true_answer"] for entry in samples],
+            "false_answer": [entry["false_answer"] for entry in samples],
+            "answer_pos": [entry["answer_pos"] for entry in samples]
+        }
+
+        if tokenize:
+            hf_dict["special_token_mask"] = [entry.get("special_token_mask", torch.zeros_like(entry["prompt"], device=self.device)) for entry in samples]
+            hf_dict["control_sequence_length"] = [entry.get("control_sequence_length", 0) for entry in samples]
+            hf_dict["attention_mask"] = [entry.get("attention_mask", torch.ones_like(entry["prompt"], device=self.device)) for entry in samples]
+
+        if pt:
+            hf_dict['prompt'] = torch.stack(hf_dict['prompt'])
+            hf_dict['true_answer'] = torch.tensor(hf_dict['true_answer'], device=self.device)
+            hf_dict['false_answer'] = torch.tensor(hf_dict['false_answer'], device=self.device)
+            hf_dict['answer_pos'] = torch.tensor(hf_dict['answer_pos'], device=self.device)
+
+            if tokenize:
+                hf_dict['special_token_mask'] = torch.stack(hf_dict['special_token_mask'])
+                hf_dict['control_sequence_length'] = torch.tensor(hf_dict['control_sequence_length'], device=self.device)
+                hf_dict['attention_mask'] = torch.stack(hf_dict['attention_mask'])
+            
+            return hf_dict
+        else:
+            return Dataset.from_dict(hf_dict)
+
+    def save_processed_subset(
+        self, 
+        eval_indices: list, 
+        batch_size: int, 
+        clean_dataset: dict, 
+        patched_dataset: dict, 
+        filename_suffix: str
+    ):
+        """
+        Creates and saves a new dataset containing only the specific clean or
+        patched runs that match the provided evaluation indices.
+
+        This version operates on the final tokenized datasets and correctly
+        assigns the "true" and "false" answers for each run. The saved file
+        contains detokenized text, ready for the get_single_dataset method.
+
+        Args:
+            eval_indices (list): A list of flat indices from the 2*N evaluation tensor.
+            batch_size (int): The batch size used during the original evaluation.
+            clean_dataset (dict): The final, tokenized clean dataset dictionary.
+            patched_dataset (dict): The final, tokenized patched dataset dictionary.
+            filename_suffix (str): A descriptive suffix for the output filename.
+        """
+        print(f"Processing {len(eval_indices)} selected evaluation runs to create new dataset...")
+
+        # Step 1: Build the definitive map from evaluation index to source index and run type.
+        # This correctly handles the final, incomplete batch.
+        source_dataset_size = len(clean_dataset['prompt'])
+        n_full_batches = source_dataset_size // batch_size
+        last_batch_size = source_dataset_size % batch_size
+        total_batches = n_full_batches + (1 if last_batch_size > 0 else 0)
+
+        eval_to_source_map = {}
+        flat_cursor, source_cursor = 0, 0
+        
+        for i in range(total_batches):
+            is_last_batch = (i == total_batches - 1) and (last_batch_size > 0)
+            current_batch_size = last_batch_size if is_last_batch else batch_size
+
+            for j in range(current_batch_size):
+                eval_to_source_map[flat_cursor + j] = (source_cursor + j, False) # False for clean run
+            flat_cursor += current_batch_size
+            
+            for j in range(current_batch_size):
+                eval_to_source_map[flat_cursor + j] = (source_cursor + j, True)  # True for patched run
+            flat_cursor += current_batch_size
+            
+            source_cursor += current_batch_size
+            
+        # Step 2: Process the selected indices and create the new samples.
+        processed_samples = []
+        eval_indices_set = set(eval_indices)
+
+        for flat_index in tqdm(eval_indices, desc="Processing samples"):
+            if flat_index not in eval_indices_set:
+                continue
+                
+            source_index, is_patched_run = eval_to_source_map[flat_index]
+
+            # --- Get the prompt tensor from the correct source ---
+            prompt_tensor = patched_dataset['prompt'][source_index] if is_patched_run else clean_dataset['prompt'][source_index]
+            
+            # --- Get the answer tokens from both sources ---
+            clean_answer_token = clean_dataset['answer'][source_index]
+            patched_answer_token = patched_dataset['answer'][source_index]
+            
+            # --- Detokenize everything to text for saving ---
+            # Filter out padding tokens before converting to string
+            pad_token_id = self.model.tokenizer.pad_token_id
+            bos_token_id = self.model.tokenizer.bos_token_id
+            special_tokens = torch.tensor([pad_token_id, bos_token_id], device=self.device)
+
+            prompt_text = self.model.to_string(prompt_tensor[~torch.isin(prompt_tensor, special_tokens)])
+            
+            # Detokenize single answer tokens
+            clean_answer_text = self.model.to_string(clean_answer_token)
+            patched_answer_text = self.model.to_string(patched_answer_token)
+            
+            # --- Correctly assign "true" and "false" answers based on the run type ---
+            if is_patched_run:
+                true_answer = patched_answer_text
+                false_answer = clean_answer_text
+            else: # is_clean_run
+                true_answer = clean_answer_text
+                false_answer = patched_answer_text
+                
+            # Assemble the new sample in the target format
+            processed_samples.append({
+                "prompt": prompt_text,
+                "true_answer": true_answer,
+                "false_answer": false_answer
+            })
+            
+        # Step 3: Create and save the new Hugging Face Dataset
+        if not processed_samples:
+            print("Warning: No samples were processed. No file will be saved.")
+            return
+            
+        new_dataset = Dataset.from_list(processed_samples)
+
+        file_name_prefix = self.dataset_name.value.replace('/', '_')
+        file_name = f"{file_name_prefix}{filename_suffix}.json"
+        
+        output_path = Path(self.base_folder_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        full_path = output_path / file_name
+
+        print(f"Saving new processed dataset with {len(new_dataset)} samples to: {full_path}")
+        new_dataset.to_json(full_path)
+        print("Save complete.")
+
+    def get_clean_corrupted_datasets(self, tokenize=True, apply_chat_template=True, prepend_generation_prefix=False, 
+                                     pt=True, filter_long_sequences=True, use_most_common_length=False, save_filtered_dataset=False):
         """
         Refactored method to return PyTorch tensors if the 'pt' parameter is set to True (default).
         For categories that require padding (QA, TRUE_FALSE), computes optimal padding.
         For categories with constant lengths (AGREEMENT, AGREEMENT_BE), no padding is applied.
         Always returns a consistent set of fields regardless of dataset category.
+
+        Args:
+            tokenize (bool): Whether to tokenize the prompts
+            apply_chat_template (bool): Whether to apply chat template
+            prepend_generation_prefix (bool): Whether to prepend generation prefix
+            pt (bool): Whether to return PyTorch tensors (True) or HuggingFace datasets (False)
+            filter_long_sequences (bool): Whether to filter out sequences longer than 99th percentile
+            use_most_common_length (bool): Whether to filter to only the most common prompt length
+            save_filtered_dataset (bool): Whether to save the filtered dataset to a new JSON file
         """
         if self.dataset_name.category.requires_padding:
             print('Figuring out optimal padding length...')
-            self.filter_and_set_max_length(apply_chat_template=apply_chat_template, prepend_generation_prefix=prepend_generation_prefix)
+            self.filter_and_set_max_length(apply_chat_template=apply_chat_template, 
+                                         prepend_generation_prefix=prepend_generation_prefix,
+                                         filter_long_sequences=filter_long_sequences,
+                                         use_most_common_length=use_most_common_length)
+            
+            if use_most_common_length and save_filtered_dataset:
+                file_name_prefix = self.dataset_name.value.replace('/', '_')
+                file_name = f"{file_name_prefix}_constant_length.json"
+                if not os.path.exists(self.base_folder_path):
+                    os.makedirs(self.base_folder_path)
+                full_path = os.path.join(self.base_folder_path, file_name)
+                self.dataset.to_json(full_path)
+                print(f"Saved dataset with constant length prompts to {full_path}")
         else:
             print(f'Dataset {self.dataset_name} has constant length prompts. Skipping padding calculation.')
 

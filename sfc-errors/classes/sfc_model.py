@@ -29,16 +29,36 @@ class AttributionPatching(Enum):
 
 ### Utility functions ###
 def sample_dataset(start_idx=0, end_idx=-1, clean_dataset=None, corrupted_dataset=None):
-    assert clean_dataset is not None or corrupted_dataset is not None, 'At least one dataset must be provided.'
-    return_values = []
+    assert clean_dataset is not None, 'Clean dataset must be provided.'
 
-    for key in ['prompt', 'answer', 'answer_pos', 'attention_mask']:
-        if clean_dataset is not None:
-            return_values.append(clean_dataset[key][start_idx:end_idx])
-        if corrupted_dataset is not None:
-            return_values.append(corrupted_dataset[key][start_idx:end_idx])
+    if corrupted_dataset is not None:
+        # Original logic for two datasets
+        clean_prompts = clean_dataset['prompt'][start_idx:end_idx]
+        corrupted_prompts = corrupted_dataset['prompt'][start_idx:end_idx]
+        clean_answers = clean_dataset['answer'][start_idx:end_idx]
+        corrupted_answers = corrupted_dataset['answer'][start_idx:end_idx]
+        clean_answers_pos = clean_dataset['answer_pos'][start_idx:end_idx]
+        corrupted_answers_pos = corrupted_dataset['answer_pos'][start_idx:end_idx]
+        clean_attn_mask = clean_dataset['attention_mask'][start_idx:end_idx]
+        corrupted_attn_mask = corrupted_dataset['attention_mask'][start_idx:end_idx]
+        
+        return clean_prompts, corrupted_prompts, clean_answers, corrupted_answers, clean_answers_pos, corrupted_answers_pos, clean_attn_mask, corrupted_attn_mask
 
-    return return_values
+    # New logic for a single dataset
+    prompts = clean_dataset['prompt'][start_idx:end_idx]
+    
+    # Handle both 'true_answer' and 'answer' for compatibility
+    true_answer_key = 'true_answer' if 'true_answer' in clean_dataset else 'answer'
+    true_answers = clean_dataset[true_answer_key][start_idx:end_idx]
+
+    false_answers = clean_dataset['false_answer'][start_idx:end_idx]
+    
+    answer_pos = clean_dataset['answer_pos'][start_idx:end_idx]
+    attention_mask = clean_dataset['attention_mask'][start_idx:end_idx]
+    
+    # When using a single dataset, there are no 'corrupted' prompts, etc.
+    # The 'corrupted_answers' are the 'false_answers'
+    return prompts, None, true_answers, false_answers, answer_pos, None, attention_mask, None
 
 ### Main class ###
 class SFC_Gemma():
