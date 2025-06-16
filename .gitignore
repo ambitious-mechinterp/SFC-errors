@@ -1,6 +1,14 @@
 # Data
 /data/*
 
+# Some temporary notebooks
+/notebooks/stage_2/ablation_restoration_main_GF.ipynb
+/notebooks/stage_2/ablation_restoration_main_GF_zero_abl.ipynb
+
+# And corresponding scripts
+/notebooks/stage_2/script/ablation_restoration_main_GF.py
+/notebooks/stage_2/script/ablation_restoration_main_GF_zero_abl.py
+
 # But allow SFC datasets (they are very light anyway)
 !/data/rc_train_filtered.json
 !/data/rc_test.json

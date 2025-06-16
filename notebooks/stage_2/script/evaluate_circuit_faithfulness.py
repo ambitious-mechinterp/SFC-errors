@@ -10,7 +10,15 @@ ipython.run_line_magic("autoreload", "2")
 
 # Standard imports
 import os
+
+### Enforce determinism
+# For CUDA >= 10.2
+# os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import torch
+# torch.use_deterministic_algorithms(True)
+# torch.manual_seed(0)
+
 import numpy as np
 from tqdm import tqdm
 import plotly.express as px
@@ -121,13 +129,25 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST_BE
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST_CONFIDENT_MODEL
 
-dataloader = SFCDatasetLoader(DATASET_NAME, model, num_samples=10000,
+dataloader = SFCDatasetLoader(DATASET_NAME, model,
                               local_dataset=True, base_folder_path=datapath)
 
 
-clean_dataset, corrupted_dataset = dataloader.get_clean_corrupted_datasets(tokenize=True, apply_chat_template=False, prepend_generation_prefix=True)
+USE_SINGLE_DATASET = DATASET_NAME.value in [SupportedDatasets.VERB_AGREEMENT_TEST_CONFIDENT_MODEL.value, SupportedDatasets.VERB_AGREEMENT_TEST_CONFIDENT_MODEL_SALIENT_CIRCUIT.value]
+
+if USE_SINGLE_DATASET:
+    dataset = dataloader.get_single_dataset(tokenize=True, apply_chat_template=False, prepend_generation_prefix=True)
+else:
+    clean_dataset, corrupted_dataset = dataloader.get_clean_corrupted_datasets(tokenize=True, apply_chat_template=False, prepend_generation_prefix=True)
+
+
+if USE_SINGLE_DATASET:
+    clean_dataset = dataset
+    corrupted_dataset = None # for bwd compatibility
+
+    print(dataset)
 
 
 # Corrupted dataset here refers to the collection of patched prompts and their answers (verb completions) in the SFC paper terminology.
@@ -147,29 +167,30 @@ for prompt in clean_dataset['prompt'][:3]:
     print(f"({i-CONTROL_SEQ_LEN}, {str_token})", end=' ')
   print()
 
-print('Corrupted dataset:')
-for prompt in corrupted_dataset['prompt'][:3]:
-  print("\nPrompt:", model.to_string(prompt), end='\n\n')
-  
-  for i, tok in enumerate(prompt):
-    str_token = model.to_string(tok)
-    print(f"({i-CONTROL_SEQ_LEN}, {str_token})", end=' ')
-  print()
+if not USE_SINGLE_DATASET:
+    print('Corrupted dataset:')
+    for prompt in corrupted_dataset['prompt'][:3]:
+      print("\nPrompt:", model.to_string(prompt), end='\n\n')
+      
+      for i, tok in enumerate(prompt):
+        str_token = model.to_string(tok)
+        print(f"({i-CONTROL_SEQ_LEN}, {str_token})", end=' ')
+      print()
 
 
 # Sanity checks
-
-# Control sequence length must be the same for all samples in both datasets
-clean_ds_control_len = clean_dataset['control_sequence_length']
-corrupted_ds_control_len = corrupted_dataset['control_sequence_length']
-
-assert torch.all(corrupted_ds_control_len == corrupted_ds_control_len[0]), "Control sequence length is not the same for all samples in the dataset"
-assert torch.all(clean_ds_control_len == clean_ds_control_len[0]), "Control sequence length is not the same for all samples in the dataset"
-assert clean_ds_control_len[0] == corrupted_ds_control_len[0], "Control sequence length is not the same for clean and corrupted samples in the dataset"
-assert clean_dataset['answer'].max().item() < model.cfg.d_vocab, "Clean answers exceed vocab size"
-assert corrupted_dataset['answer'].max().item() < model.cfg.d_vocab, "Patched answers exceed vocab size"
-assert (clean_dataset['answer_pos'] < N_CONTEXT).all().item(), "Answer positions exceed logits length"
-assert (corrupted_dataset['answer_pos'] < N_CONTEXT).all().item(), "Answer positions exceed logits length"
+if not USE_SINGLE_DATASET:
+    # Control sequence length must be the same for all samples in both datasets
+    clean_ds_control_len = clean_dataset['control_sequence_length']
+    corrupted_ds_control_len = corrupted_dataset['control_sequence_length']
+    
+    assert torch.all(corrupted_ds_control_len == corrupted_ds_control_len[0]), "Control sequence length is not the same for all samples in the dataset"
+    assert torch.all(clean_ds_control_len == clean_ds_control_len[0]), "Control sequence length is not the same for all samples in the dataset"
+    assert clean_ds_control_len[0] == corrupted_ds_control_len[0], "Control sequence length is not the same for clean and corrupted samples in the dataset"
+else:
+    assert dataset['true_answer'].max().item() < model.cfg.d_vocab, "Patched answers exceed vocab size"
+    assert dataset['false_answer'].max().item() < model.cfg.d_vocab, "Patched answers exceed vocab size"
+    assert (dataset['answer_pos'] < N_CONTEXT).all().item(), "Answer positions exceed logits length"
 
 
 # # Setting up the SAEs
@@ -182,7 +203,7 @@ RUN_WITH_SAES = True # we'll need to run the model with attached SAEs
 if RUN_WITH_SAES:
     caching_device = device 
 else:
-    caching_device = "cuda:0"
+    caching_device = "cuda:3"
 
 
 caching_device
@@ -192,7 +213,7 @@ caching_device
 # - Loads a Gemma model and its Gemma Scope SAEs (either attaching them to the model or not)
 # - Provides interface methods to compute SFC scores (currently, only attr patching is supported) on an arbitrary dataset (that follows the format of my SFCDatasetLoader class from above)
 
-EXPERIMENT = 'sva_rc_be'
+EXPERIMENT = 'sva_rc_test'
 
 clear_cache()
 sfc_model = SFC_Gemma(model, params_count=PARAMS_COUNT, control_seq_len=CONTROL_SEQ_LEN, 
@@ -210,7 +231,6 @@ clear_cache()
 # Here we'll call use CircuitEvaluator class, which encapsulates the SFC circuit evaluation logic.
 
 from classes.sfc_evaluator import CircuitEvaluator
-
 circuit_evaluator = CircuitEvaluator(sfc_model)
 
 
@@ -220,24 +240,65 @@ circuit_evaluator = CircuitEvaluator(sfc_model)
 
 import numpy as np
 
-batch_size = 1024
-total_batches = None
+# Define threshold range (logarithmic scale) for SFC scores, which controls the number of nodes in the circuit
 total_thresholds = 20
 
-# Define threshold range (logarithmic scale) for SFC scores, which controls the number of nodes in the circuit
-# (only the nodes above the threshold are kept in the circuit)
+a, b = 0.000027, 0.000032
+
 thresholds = np.concatenate([
-    # A few samples below 0.00001
-    np.logspace(-6, -5, int(total_thresholds * 0.2), endpoint=False),
-    # Dense sampling in the more interesting region of [0.00001, 0.01]
-    np.logspace(-5, -2, int(total_thresholds * 0.8)),
-    # No samples above 0.01
+    # Coarse sampling below and above the zoomed-in region
+    np.logspace(-5.5, np.log10(a), int(total_thresholds * 0.4), endpoint=False),
+    
+    # Dense sampling in the interesting region [a, b]
+    np.logspace(np.log10(a), np.log10(b), int(total_thresholds * 0.2), endpoint=False),
+    
+    # Coarse sampling after the dense region
+    np.logspace(np.log10(b), -3, int(total_thresholds * 0.4)),
 ])
+# Or hard-code a specific threshold
+# thresholds = [
+#     thresholds[2] # 0.000139,
+# ]
 
 # Print the thresholds to verify
 print("Threshold values:")
 for t in thresholds:
     print(f"{t:.6f}")
+
+
+nodes_per_threshold = []
+
+for t in thresholds:
+    # Initialize the ablation masks dictionary, mapping node names to their ablation masks
+    ablation_masks = {}  
+    n_nodes_in_circuit = 0
+    
+    threshold_ablation_masks = circuit_evaluator.determine_nodes_to_ablate(t)
+            
+    for node_name, mask in threshold_ablation_masks.items():
+        ablation_masks[node_name] = mask
+
+    # If cutoff_early_layers is True, we don't ablate the first layers of the model
+    # early_layer_cutoff = self.model_wrapper.n_layers // 3  # First 1/3 of layers
+
+    # for key in ablation_masks.keys():
+    #     # Parse act name like this "blocks.5.hook_resid_post.hook_sae_acts_post"
+    #     layer_str = key.split('.')[1]  # Gets "5" from the example
+    #     layer_num = int(layer_str)
+        
+    #     # If node is from early layers, add to restore list and clear its ablation mask
+    #     if layer_num < early_layer_cutoff:
+    #         if key not in nodes_to_restore:
+    #             nodes_to_restore.append(key)
+
+    # Step 3: count how many nodes will be in the circuit (nodes that are not being ablated)
+    for key, mask in ablation_masks.items():
+        n_nodes_in_circuit += torch.sum(~mask).item()  # count the number of nodes for which mask is False (i.e. not ablated)
+
+    nodes_per_threshold.append(n_nodes_in_circuit)
+
+for n_nodes, t in zip(nodes_per_threshold, thresholds):
+    print(n_nodes, ' - ', f'{t:.6f}') 
 
 
 # Reset the hooks to avoid weird bugs
@@ -251,42 +312,137 @@ from tqdm.notebook import tqdm
 import pandas as pd
 from IPython.display import display
 
+batch_size = 1024
+total_batches = None
+
+# --- This new list will store the detailed per-sample scores for later plotting ---
+faithfulness_scores_by_threshold = []
+
+# --- Modified Main Loop ---
 results = []
-print("Evaluating standard circuit faithfulness...")
+N_OUTLIERS_TO_SHOW = 3 # How many top/bottom outliers to display
+print("Evaluating standard circuit faithfulness and analyzing outliers...")
 
+original_circuit_metrics_by_threshold = {}
 for i, threshold in enumerate(thresholds):
-    print(f'Thresholds progress {i}/{len(thresholds)}')
+    print(f"\n{'='*50}\nThreshold: {threshold:.6f} ({i+1}/{len(thresholds)})\n{'='*50}")
 
-    # Evaluate standard circuit (no special ablations)
-    faithfulness, n_nodes = circuit_evaluator.evaluate_circuit_faithfulness(
+    faithfulness, n_nodes, circuit_m, full_m, empty_m = circuit_evaluator.evaluate_circuit_faithfulness(
         clean_dataset, 
         corrupted_dataset, 
-        node_threshold=threshold,
+        node_threshold=threshold, 
+        
         batch_size=batch_size,
         total_batches=total_batches,
-        verbose = i == 0, # log only for the first batch
-        return_all_metrics = True
+        
+        verbose = True,
+        return_all_metrics = True,
+        _return_components_for_verification=True
     )
     
-    # Calculate average faithfulness and standard deviation
-    avg_faithfulness = faithfulness.mean().item()
-    std_faithfulness = faithfulness.std().item()
+    # Store the circuit metrics for the current threshold
+    original_circuit_metrics_by_threshold[threshold] = circuit_m
+
+    if i == 0:
+        # Construct the key that was just used to populate the cache
+        # cache_key = (id(clean_dataset), id(corrupted_dataset), batch_size, total_batches)
+        original_full_empty_metrics = empty_m # circuit_evaluator._empty_circuit_metrics_cache[cache_key]
+        original_full_model_metrics = full_m
+        print("Captured the original circuit metrics for verification. Shape ", original_full_empty_metrics.shape)
+    
+    # Store all scores for this threshold for later histogram plotting
+    faithfulness_scores_by_threshold.append({
+        'threshold': threshold,
+        'n_nodes': n_nodes,
+        'scores': faithfulness.cpu()
+    })
+        
+    # Filter out inf/nan for robust analysis
+    finite_mask = torch.isfinite(faithfulness)
+    finite_scores = faithfulness[finite_mask]
+    finite_indices = torch.where(finite_mask)[0]
+    
+    print(f"Total scores: {len(faithfulness)}, Finite scores: {len(finite_scores)}")
+    
+    # Calculate mean and std on the filtered scores
+    mean_faithfulness = finite_scores.mean().item()
+    std_faithfulness = finite_scores.std().item()
     
     results.append({
         'threshold': threshold,
         'n_nodes': n_nodes,
-        'faithfulness': avg_faithfulness,
+        'faithfulness': mean_faithfulness,
         'std_faithfulness': std_faithfulness,
         'circuit_type': 'standard'
     })
 
+
+import torch
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+def save_full_experiment_results(
+    faithfulness_scores: List[Dict[str, Any]],
+    circuit_metrics: Dict[float, torch.Tensor],
+    full_model_metrics: torch.Tensor,
+    empty_circuit_metrics: torch.Tensor,
+    data_dir: str,
+    experiment_name: str,
+    filename: str = "full_experiment_results.pt"
+):
+    """
+    Saves all key data structures from a faithfulness evaluation run into a single file.
+
+    This includes:
+    - The per-sample faithfulness scores for each threshold.
+    - The per-sample circuit metrics (m(C)) for each threshold.
+    - The per-sample full model metrics (m(M)).
+    - The per-sample empty circuit metrics (m(∅)).
+
+    Args:
+        faithfulness_scores: The 'faithfulness_scores_by_threshold' list.
+        circuit_metrics: The 'original_circuit_metrics_by_threshold' dictionary.
+        full_model_metrics: The 'original_full_model_metrics' tensor.
+        empty_circuit_metrics: The 'original_full_empty_metrics' tensor.
+        data_dir: The base data directory path.
+        experiment_name: The name of the specific experiment sub-folder.
+        filename: The name of the file to save.
+    """
+    # Bundle all data into a single dictionary
+    results_bundle = {
+        'faithfulness_scores_by_threshold': faithfulness_scores,
+        'circuit_metrics_by_threshold': circuit_metrics,
+        'full_model_metrics': full_model_metrics,
+        'empty_circuit_metrics': empty_circuit_metrics
+    }
+    
+    # Construct the full path
+    experiment_path = Path(data_dir) / experiment_name
+    experiment_path.mkdir(parents=True, exist_ok=True)
+    filepath = experiment_path / filename
+    
+    print(f"Saving full experiment results bundle to: {filepath}")
+    torch.save(results_bundle, filepath)
+    print("Save complete.")
+    
+    return faithfulness_scores, circuit_metrics, full_model_metrics, empty_circuit_metrics
+
+save_full_experiment_results(
+    faithfulness_scores=faithfulness_scores_by_threshold,
+    circuit_metrics=original_circuit_metrics_by_threshold,
+    full_model_metrics=original_full_model_metrics,
+    empty_circuit_metrics=original_full_empty_metrics,
+    data_dir=datapath,
+    experiment_name=EXPERIMENT,
+    filename='faith_filtered_full.pt'
+)
+
+
 results_df = pd.DataFrame(results)
+results_df.to_csv(datapath / EXPERIMENT / "faithfulness_eval.csv")
+
+print("\n--- Aggregated Results ---")
 print(results_df)
-
-
-save_dir = datapath / EXPERIMENT
-
-results_df.to_csv(save_dir / "faithfulness_eval.csv", index=False)
 
 
 # ## Faithfulness eval when resid error nodes are ablated
@@ -318,14 +474,19 @@ for i, threshold in enumerate(thresholds):
         return_all_metrics = True
     )
     
-    # Calculate average faithfulness and standard deviation
-    avg_faithfulness = faithfulness.mean().item()
-    std_faithfulness = faithfulness.std().item()
+    # Before computing the mean and std metrics, filter out infs which seem to be pathological
+    faithfulness_finite_mask = torch.isfinite(faithfulness)
+    infinite_values_count = (~faithfulness_finite_mask).sum()
+    if infinite_values_count > 0:
+        print(f'Filtered out {infinite_values_count} infinite metrics')
+    
+    mean_faithfulness = faithfulness[faithfulness_finite_mask].mean().item()
+    std_faithfulness = faithfulness[faithfulness_finite_mask].std().item()
     
     results.append({
         'threshold': threshold,
         'n_nodes': n_nodes,
-        'faithfulness': avg_faithfulness,
+        'faithfulness': mean_faithfulness,
         'std_faithfulness': std_faithfulness,
         'circuit_type': 'resid_errors_ablated'
     })
@@ -333,6 +494,9 @@ for i, threshold in enumerate(thresholds):
 # Convert results to DataFrame
 resid_errors_ablated_results_df = pd.DataFrame(results)
 print(resid_errors_ablated_results_df)
+
+
+save_dir = datapath / EXPERIMENT
 
 
 resid_errors_ablated_results_df.to_csv(save_dir / "faithfulness_eval_resid_err_abl.csv", index=False)
@@ -366,14 +530,19 @@ for i, threshold in enumerate(thresholds):
         return_all_metrics = True
     )
     
-    # Calculate average faithfulness and standard deviation
-    avg_faithfulness = faithfulness.mean().item()
-    std_faithfulness = faithfulness.std().item()
+    # Before computing the mean and std metrics, filter out infs which seem to be pathological
+    faithfulness_finite_mask = torch.isfinite(faithfulness)
+    infinite_values_count = (~faithfulness_finite_mask).sum()
+    if infinite_values_count > 0:
+        print(f'Filtered out {infinite_values_count} infinite metrics')
+    
+    mean_faithfulness = faithfulness[faithfulness_finite_mask].mean().item()
+    std_faithfulness = faithfulness[faithfulness_finite_mask].std().item()
     
     results.append({
         'threshold': threshold,
         'n_nodes': n_nodes,
-        'faithfulness': avg_faithfulness,
+        'faithfulness': mean_faithfulness,
         'std_faithfulness': std_faithfulness,
         'circuit_type': 'errors_ablated'
     })
@@ -478,11 +647,15 @@ datapath
 
 
 # Load the CSV files with our metrics
-EXPERIMENT = 'sva_rc_be'
+EXPERIMENT = 'sva_rc_filtered' # 'sva_rc_filtered'
 
 standard_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval.csv")
 resid_errors_ablated_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval_resid_err_abl.csv")
 errors_ablated_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_eval_mlpattn_err_abl.csv")
+
+
+N_SAMPLES = clean_dataset['prompt'].shape[0]
+N_SAMPLES
 
 
 # ## Plots
@@ -491,7 +664,7 @@ errors_ablated_results_df = pd.read_csv(datapath / EXPERIMENT / "faithfulness_ev
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-def plot_faithfulness_single(results_df, circuit_type='standard'):
+def plot_faithfulness_single(results_df, circuit_type='standard', n_samples = N_SAMPLES):
     """
     Create plots similar to those in the SFC paper, with error bars.
     
@@ -517,7 +690,7 @@ def plot_faithfulness_single(results_df, circuit_type='standard'):
             name='Faithfulness',
             error_y=dict(
                 type='data',
-                array=results_df['std_faithfulness'],
+                array=results_df['std_faithfulness'] / np.sqrt(n_samples),
                 visible=True,
                 thickness=1,
                 width=3
@@ -552,48 +725,53 @@ plot_faithfulness_single(errors_ablated_results_df, circuit_type='mlp/attn error
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
+import plotly.io as pio
 
-def plot_multiple_faithfulness_results(dataframes_list, title="Circuit Faithfulness Comparison"):
+def plot_multiple_faithfulness_results(dataframes_list, plot_stds=None, title="Circuit Faithfulness Comparison", n_samples=1):
     """
     Create a plot with multiple faithfulness lines from different dataframes.
-    
+
     Args:
         dataframes_list: List of DataFrames, each containing faithfulness results
+        plot_stds: List of booleans, one per dataframe, indicating whether to plot std shading
         title: Title for the plot
-    
+        n_samples: Used if needed for error scaling
+
     Returns:
         Plotly figure
     """
     fig = go.Figure()
     
-    # Default Plotly colors
     plotly_colors = [
-        '#1f77b4',  # blue
-        '#ff7f0e',  # orange
-        '#2ca02c',  # green
-        '#d62728',  # red
-        '#9467bd',  # purple
-        '#8c564b',  # brown
-        '#e377c2',  # pink
-        '#7f7f7f',  # gray
-        '#bcbd22',  # olive
-        '#17becf'   # teal
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+        '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
     ]
     
-    # Add a trace for each dataframe
+    if plot_stds is None:
+        plot_stds = [True] * len(dataframes_list)
+
     for i, df in enumerate(dataframes_list):
-        # Extract circuit type for label
         circuit_type = df['circuit_type'].iloc[0] if 'circuit_type' in df.columns else f"Circuit {i+1}"
-        
-        # Sort by number of nodes for proper line plotting
         df_sorted = df.sort_values('n_nodes')
-        
-        # Get color for this circuit and create transparent version for error bands
+
         line_color = plotly_colors[i % len(plotly_colors)]
-        # Convert hex to rgba with transparency
         rgba_color = f"rgba({int(line_color[1:3], 16)}, {int(line_color[3:5], 16)}, {int(line_color[5:7], 16)}, 0.3)"
-        
-        # Add line trace
+
+        if 'std_faithfulness' in df_sorted.columns:
+            custom_data = np.stack([df_sorted['std_faithfulness']], axis=-1)
+            hover_template = (
+                'Nodes: %{x}<br>'
+                'Faithfulness: %{y:.3f}<br>'
+                'Std: %{customdata[0]:.3f}<extra>%{fullData.name}</extra>'
+            )
+        else:
+            custom_data = None
+            hover_template = (
+                'Nodes: %{x}<br>'
+                'Faithfulness: %{y:.3f}<extra>%{fullData.name}</extra>'
+            )
+
+        # Add main line
         fig.add_trace(
             go.Scatter(
                 x=df_sorted['n_nodes'],
@@ -602,16 +780,20 @@ def plot_multiple_faithfulness_results(dataframes_list, title="Circuit Faithfuln
                 name=circuit_type,
                 line=dict(color=line_color),
                 legendgroup=f"group{i}",
-                hovertemplate='Nodes: %{x}<br>Faithfulness: %{y:.3f}±%{error_y.array:.3f}'
+                customdata=custom_data,
+                hovertemplate=hover_template
             )
         )
-        
-        # Add error bars as a separate trace
-        if 'std_faithfulness' in df_sorted.columns:
+
+        # Conditionally add std shading
+        if plot_stds[i] and 'std_faithfulness' in df_sorted.columns:
+            upper = df_sorted['faithfulness'] + df_sorted['std_faithfulness']
+            lower = df_sorted['faithfulness'] - df_sorted['std_faithfulness']
+
             fig.add_trace(
                 go.Scatter(
                     x=df_sorted['n_nodes'],
-                    y=df_sorted['faithfulness'] + df_sorted['std_faithfulness'],
+                    y=upper,
                     mode='lines',
                     line=dict(width=0),
                     showlegend=False,
@@ -619,11 +801,11 @@ def plot_multiple_faithfulness_results(dataframes_list, title="Circuit Faithfuln
                     hoverinfo='skip'
                 )
             )
-            
+
             fig.add_trace(
                 go.Scatter(
                     x=df_sorted['n_nodes'],
-                    y=df_sorted['faithfulness'] - df_sorted['std_faithfulness'],
+                    y=lower,
                     mode='lines',
                     line=dict(width=0),
                     fillcolor=rgba_color,
@@ -633,8 +815,7 @@ def plot_multiple_faithfulness_results(dataframes_list, title="Circuit Faithfuln
                     hoverinfo='skip'
                 )
             )
-    
-    # Update layout
+
     fig.update_layout(
         title=title,
         xaxis_title="Number of Nodes in Circuit",
@@ -652,12 +833,27 @@ def plot_multiple_faithfulness_results(dataframes_list, title="Circuit Faithfuln
             x=1
         )
     )
-    
+
     return fig
 
 
-plot_multiple_faithfulness_results(
+standard_results_df['circuit_type'] = 'Standard'
+errors_ablated_results_df['circuit_type'] = 'MLP & Attn errors ablated'
+resid_errors_ablated_results_df['circuit_type'] = 'Resid errors ablated'
+
+
+fig = plot_multiple_faithfulness_results(
     [standard_results_df, resid_errors_ablated_results_df, errors_ablated_results_df], 
+    plot_stds=[False, False, False],
+    title="Comparison of Circuit Faithfulness Across Configurations"
+)
+pio.write_image(fig, "faithfulness_original_comparison.png", format='png', scale=3, width=900, height=600)
+
+fig.show()
+
+
+plot_multiple_faithfulness_results(
+    [standard_results_df], 
     title="Comparison of Circuit Faithfulness Across Configurations"
 ).show()
 

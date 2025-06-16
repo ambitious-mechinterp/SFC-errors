@@ -107,7 +107,7 @@ import utils.prompts as prompts
 from utils.enums import *
 
 
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_BE
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model,
                               local_dataset=True, base_folder_path=datapath)
@@ -168,7 +168,7 @@ RUN_WITH_SAES = True # we'll need to run the model with attached SAEs to store t
 if RUN_WITH_SAES:
     caching_device = device 
 else:
-    caching_device = "cuda:0"
+    caching_device = "cuda:3"
 
 
 caching_device

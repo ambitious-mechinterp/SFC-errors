@@ -236,7 +236,7 @@ class SFC_Gemma():
         Compute activation patching scores for SAE error terms.
         This method is a wrapper around the standalone compute_error_patching_scores function, so consult the documentation there for more details.
         """
-        
+            
         # Create a function that accesses the instance method get_logit_diff
         get_logit_diff_fn = lambda logits, clean_answers, patched_answers, answer_pos: self.get_logit_diff(
             logits, clean_answers, patched_answers, answer_pos

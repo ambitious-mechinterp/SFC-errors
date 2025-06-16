@@ -3,9 +3,6 @@
 
 # ## Setup
 
-# In[1]:
-
-
 from IPython import get_ipython # type: ignore
 ipython = get_ipython(); assert ipython is not None
 ipython.run_line_magic("load_ext", "autoreload")
@@ -33,7 +30,7 @@ from torch import Tensor
 torch.set_grad_enabled(False)
 
 # Device setup
-GPU_TO_USE = 2
+GPU_TO_USE = 3
 
 if torch.backends.mps.is_available():
     device = "mps"
@@ -47,9 +44,6 @@ import gc
 def clear_cache():
     gc.collect()
     torch.cuda.empty_cache()
-
-
-# In[2]:
 
 
 from pathlib import Path
@@ -82,9 +76,6 @@ def get_data_path(base_folder=None, data_folder_name='data'):
 	return Path(base_folder) / data_folder_name
 
 
-# In[3]:
-
-
 base_path = get_base_folder()
 print(f"Base path: {base_path}")
 
@@ -95,14 +86,8 @@ sys.path.append(base_path)
 sys.path.append(str(project_path))
 
 
-# In[4]:
-
-
 datapath = get_data_path(base_path) 
 datapath
-
-
-# In[5]:
 
 
 # Additionally, setup the logging file so that we can track the output even when disconnected from the front-end Jupyter interface
@@ -123,9 +108,6 @@ get_ipython().run_line_magic('autosave', '5')
 
 # We'll work with Gemma-2 2B (base version)
 
-# In[13]:
-
-
 from sae_lens import HookedSAETransformer
 
 USE_INSTRUCT = False
@@ -142,24 +124,15 @@ model
 
 # This uses my custom dataloader class, which parses raw data and prepares into a nice format for SFC, including providing some useful metadata such as token positions for where the answer should be, attention masks etc. The details of the class are convoluted because it was developed for a more general purpose than verb agreement tasks, so you can largely ignore the next few cells.
 
-# In[14]:
-
-
 from classes.sfc_data_loader import SFCDatasetLoader
 import utils.prompts as prompts
 from utils.enums import *
-
-
-# In[15]:
 
 
 DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model,
                               local_dataset=True, base_folder_path=datapath)
-
-
-# In[16]:
 
 
 clean_dataset, corrupted_dataset = dataloader.get_clean_corrupted_datasets(tokenize=True, apply_chat_template=False, 
@@ -170,16 +143,10 @@ clean_dataset, corrupted_dataset = dataloader.get_clean_corrupted_datasets(token
 
 # Corrupted dataset here refers to the collection of patched prompts and their answers (verb completions) in the SFC paper terminology.
 
-# In[17]:
-
-
 CONTROL_SEQ_LEN = clean_dataset['control_sequence_length'][0].item() # how many first tokens to ignore when computing SFC scores
 N_CONTEXT = clean_dataset['prompt'].shape[1]
 
 CONTROL_SEQ_LEN, N_CONTEXT
-
-
-# In[18]:
 
 
 print('Clean dataset:')
@@ -201,15 +168,6 @@ for prompt in corrupted_dataset['prompt'][:3]:
   print()
 
 
-# In[155]:
-
-
-model.to_string(0)
-
-
-# In[19]:
-
-
 # Sanity checks
 
 # Control sequence length must be the same for all samples in both datasets
@@ -226,9 +184,6 @@ assert (corrupted_dataset['answer_pos'] < N_CONTEXT).all().item(), "Answer posit
 
 
 # # Setting up the SAEs
-
-# In[20]:
-
 
 from classes.sfc_model import SFC_Gemma
 
@@ -248,9 +203,6 @@ caching_device
 # - Loads a Gemma model and its Gemma Scope SAEs (either attaching them to the model or not)
 # - Provides interface methods to compute SFC scores (currently, only attr patching is supported) on an arbitrary dataset (that follows the format of my SFCDatasetLoader class from above)
 
-# In[21]:
-
-
 EXPERIMENT = 'sva_rc_test'
 
 clear_cache()
@@ -268,14 +220,8 @@ clear_cache()
 
 # Here we'll call use CircuitEvaluator class, which encapsulates the SFC circuit evaluation logic.
 
-# In[170]:
-
-
 from classes.sfc_evaluator import CircuitEvaluator
 circuit_evaluator = CircuitEvaluator(sfc_model)
-
-
-# In[171]:
 
 
 # Reset the hooks to avoid weird bugs
@@ -285,17 +231,11 @@ if RUN_WITH_SAES:
 clear_cache()
 
 
-# In[173]:
-
-
 # IMPORTANT - this should match the batch size used to compute the scores that are loaded below
 batch_size = 1024
 
 
 # ## Loading the faithfulness scores
-
-# In[174]:
-
 
 from typing import List, Dict, Any, Tuple
 
@@ -336,11 +276,8 @@ def load_full_experiment_results(
     return faithfulness_scores, circuit_metrics, full_model_metrics, empty_circuit_metrics
 
 
-# In[225]:
-
-
-FNAME = 'faith_filtered_mm_4_mc_2.pt' # 'faith_filtered_mm_4.pt' # 'faith_all_thresholds.pt'
-EXPERIMENT = 'sva_rc_filtered' # sva_rc_filtered, sva_rc_test
+FNAME = 'faith_filtered_full.pt' # 'faith_filtered_mm_4.pt' # 'faith_all_thresholds.pt', faith_filtered_full.pt faith_filtered_mm_4_mc_2.pt
+EXPERIMENT = 'sva_rc_test' # sva_rc_filtered, sva_rc_test
 
 # --- 1. Load all results from the file ---
 (faithfulness_scores_by_threshold, 
@@ -369,9 +306,6 @@ if faithfulness_scores_by_threshold is not None:
 
 # ## Plot Histograms of Faithfulness Scores for Each Threshold
 
-# In[227]:
-
-
 # In a new cell after the evaluation loop
 
 import plotly.express as px
@@ -394,7 +328,7 @@ for result in faithfulness_scores_by_threshold:
     std_val = np.std(scores)
     
     # --- MODIFICATION: Create a dynamic title with the stats ---
-    title_text = (f"Faithfulness Distribution (Threshold: {threshold:.6f}, Nodes: {n_nodes})<br>"
+    title_text = (f"Faithfulness Distribution " # (Threshold: {threshold:.6f}, Nodes: {n_nodes})<br>"
                   f"Mean: {mean_val:.3f} | Std: {std_val:.3f}")
 
     fig = px.histogram(
@@ -424,10 +358,8 @@ for result in faithfulness_scores_by_threshold:
 
 # ## Outlier scores analysis
 
-# In[229]:
-
-
 import plotly.express as px
+import plotly.io as pio
 import torch
 import numpy as np
 import pandas as pd
@@ -441,7 +373,7 @@ from IPython.display import display
 
 # --- 1. Select Data for a Single Threshold ---
 
-threshold_index_to_analyze = 0
+threshold_index_to_analyze = 12
 selected_threshold_data = faithfulness_scores_by_threshold[threshold_index_to_analyze]
 selected_faithfulness_scores = selected_threshold_data['scores']
 selected_circuit_metrics = original_circuit_metrics_by_threshold[selected_threshold_data['threshold']]
@@ -469,7 +401,7 @@ std_faithfulness = df['faithfulness_score'].std()
 # --- MODIFICATION: Create the new, more informative title ---
 new_title_text = (
     f"Faithfulness vs. Full Model Metric (m(M))<br>"
-    f"Nodes: {n_nodes:,} | Mean Faithfulness: {mean_faithfulness:.3f} ± {std_faithfulness:.3f}"
+    f"Samples: {len(df)} | 1K Nodes circuit | Mean Faithfulness: {mean_faithfulness:.3f} ± {std_faithfulness:.3f}"
 )
 
 # --- 3. Create the Interactive Scatter Plot using the DataFrame ---
@@ -501,15 +433,15 @@ fig.update_traces(
 
 # --- 4. Add Vertical and Horizontal Lines ---
 
-# Vertical lines for m(M)
-fig.add_vline(
-    x=1, line_width=2, line_dash="dash", line_color="red",
-    annotation_text="m(M) = 1", annotation_position="top right"
-)
-fig.add_vline(
-    x=-1, line_width=2, line_dash="dash", line_color="red",
-    annotation_text="m(M) = -1", annotation_position="top left"
-)
+# # Vertical lines for m(M)
+# fig.add_vline(
+#     x=1, line_width=2, line_dash="dash", line_color="red",
+#     annotation_text="m(M) = 1", annotation_position="top right"
+# )
+# fig.add_vline(
+#     x=-1, line_width=2, line_dash="dash", line_color="red",
+#     annotation_text="m(M) = -1", annotation_position="top left"
+# )
 
 # --- MODIFICATION: Add horizontal line for mean faithfulness ---
 fig.add_hline(
@@ -528,13 +460,11 @@ fig.add_hline(
 fig.update_layout(
     title_x=0.5,
     xaxis=dict(dtick=1),
-    height=600,
+    height=700,
 )
+pio.write_image(fig, f"faithfulness_outliers_original_{n_nodes}_nodes.png", format='png', scale=3, width=1000, height=700)
 
 fig.show()
-
-
-# In[233]:
 
 
 import plotly.express as px
@@ -558,9 +488,6 @@ fig_circuit_hist.update_layout(title_x=0., height=600)
 fig_circuit_hist.show()
 
 
-# In[234]:
-
-
 import plotly.express as px
 
 # --- Plot the distribution of Empty Circuit Metrics ---
@@ -581,15 +508,13 @@ fig_empty_hist = px.histogram(
 
 # Center the title and show the plot
 fig_empty_hist.update_layout(title_x=0.5)
+pio.write_image(fig_empty_hist, f"faithfulness_empty_circuit.png", format='png', scale=3, height=400)
 fig_empty_hist.show()
 
 
 # ## Filtering outliers
 
 # How many samples do we have larger than a given threshold for full model metric m(M)?
-
-# In[217]:
-
 
 import plotly.express as px
 import torch
@@ -678,16 +603,13 @@ else:
 
 # ### Filtering based on full model metric (only) 
 
-# In[218]:
-
-
 import plotly.express as px
 import torch
 
 # --- 1. Configuration ---
 
 # Choose which threshold's faithfulness scores to analyze
-threshold_index_to_analyze = 2
+threshold_index_to_analyze = 12
 # Define the cutoff for the full model metric
 MM_CUTOFF_POSITIVE = 4.0
 
@@ -736,9 +658,6 @@ fig_mm_subset.update_layout(title_x=0.5, bargap=0.1)
 fig_mm_subset.show()
 
 
-# In[167]:
-
-
 import torch
 import numpy as np
 
@@ -760,11 +679,8 @@ dataloader.save_processed_subset(
     batch_size=batch_size,
     clean_dataset=clean_dataset,        # Pass the tokenized clean dataset
     patched_dataset=corrupted_dataset,  # Pass the tokenized patched dataset
-    filename_suffix=f"_processed_mm_gt_{str(MM_CUTOFF_POSITIVE).replace('.', 'p')}"
+    filename_suffix=f"_full_sfc_mm_gt_{str(MM_CUTOFF_POSITIVE).replace('.', 'p')}"
 )
-
-
-# In[219]:
 
 
 import plotly.express as px
@@ -854,16 +770,13 @@ else:
 
 # ### Filtering based on full model metric AND circuit metric
 
-# In[220]:
-
-
 import torch
 import numpy as np
 
 # --- 1. Configuration ---
 # Assumes 'dataloader', 'batch_size', 'clean_dataset', and 'corrupted_dataset' are available.
 
-threshold_index_to_analyze = 2
+threshold_index_to_analyze = 12
 
 # --- 2. Identify the Evaluation Indices to Save ---
 result_data = faithfulness_scores_by_threshold[threshold_index_to_analyze]
@@ -890,9 +803,6 @@ dataloader.save_processed_subset(
     patched_dataset=corrupted_dataset,  # Pass the tokenized patched dataset
     filename_suffix=f"_processed_mm_gt_{str(MM_THRESHOLD).replace('.', 'p')}_mc_gt_{str(MC_THRESHOLD).replace('.', 'p')}"
 )
-
-
-# In[224]:
 
 
 import plotly.express as px
@@ -937,9 +847,6 @@ fig_joint_subset.show()
 
 
 # ## Sanity check
-
-# In[38]:
-
 
 import pandas as pd
 from collections import defaultdict
@@ -1093,9 +1000,6 @@ for result in faithfulness_scores_by_threshold:
 print("\nProcessing complete. `outlier_datasets_by_threshold` has been rebuilt with paired data.")
 
 
-# In[39]:
-
-
 # ==============================================================================
 # 4. VERIFICATION AND USAGE EXAMPLE (for Paired Data)
 # ==============================================================================
@@ -1204,9 +1108,6 @@ else:
 
 
 # #### Main test
-
-# In[ ]:
-
 
 # ==============================================================================
 # 1. CONFIGURATION FOR VERIFICATION
@@ -1360,9 +1261,6 @@ else:
         circuit_evaluator,
         full_circuit_metrics=selected_circuit_metrics
     )
-
-
-# In[ ]:
 
 
 

@@ -195,8 +195,10 @@ class CircuitEvaluator:
         Evaluate the faithfulness of a circuit by selectively ablating and restoring nodes.
         
         Args:
-            clean_dataset: The clean dataset to evaluate on
-            patched_dataset: The patched dataset to evaluate on
+            clean_dataset: The clean dataset to evaluate on. 
+                It's the main dataset if only using a single dataset with true/false answers.
+            patched_dataset: The patched dataset to evaluate on. 
+                Can be None if using only a single dataset with true/false answers.
             node_threshold: Threshold to determine circuit nodes. 
                             If None, operates entirely based on nodes_to_always_ablate and nodes_to_restore
 
@@ -206,6 +208,7 @@ class CircuitEvaluator:
                                      and/or `feature_indices_to_ablate`. If not given, all positions are ablated by default.
             feature_indices_to_ablate: Dictionary mapping SAE feature node names to lists of feature indices to ablate.
                                        Only applies to SAE feature nodes (hook_sae_acts_post).
+            use_zero_ablation: Whether to use zero ablation instead of mean ablation
 
             nodes_to_restore: List of node names to restore activation for
             feature_indices_to_restore: Dictionary mapping node names to lists of feature indices to restore.
@@ -458,8 +461,11 @@ class CircuitEvaluator:
         Optionally, restore the activations of other specified nodes, i.e. patch in their activations as they would have been without ablation.
         
         Args:
-            clean_dataset: The clean dataset to evaluate on
-            patched_dataset: The patched dataset to evaluate on
+            clean_dataset: The clean dataset to evaluate on. 
+                It's the main dataset if only using a single dataset with true/false answers.
+            patched_dataset: The patched dataset to evaluate on. 
+                Can be None if using only a single dataset with true/false answers.
+                In this case the logit difference is computed between true_answer and false_answer tokens.
 
             nodes_to_ablate: Dictionary mapping node names to binary masks indicating which positions 
                              (and features in case of SAE latent nodes) to ablate
@@ -472,6 +478,7 @@ class CircuitEvaluator:
 
             ablation_values: Dictionary mapping node names to their substitution values for ablation.
                              Defaults to using mean (position-aware) activation values
+            use_zero_ablation: Whether to use zero ablation instead of mean ablation
             run_full_model: Whether to run the full model without ablation for returning the full model metric value.
                             Must be true when nodes_to_restore is not empty, because we need the original cache to restore the activations.
 
