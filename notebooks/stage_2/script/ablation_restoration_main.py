@@ -22,7 +22,7 @@ from torch import Tensor
 torch.set_grad_enabled(False)
 
 # Device setup
-GPU_TO_USE = 2
+GPU_TO_USE = 3
 
 if torch.backends.mps.is_available():
     device = "mps"
@@ -122,7 +122,7 @@ from utils.enums import *
 
 
 # Load one of the supported dataset
-DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST_CONFIDENT_MODEL_SALIENT_CIRCUIT
+DATASET_NAME = SupportedDatasets.VERB_AGREEMENT_TEST_CONFIDENT_MODEL
 
 dataloader = SFCDatasetLoader(DATASET_NAME, model,
                               local_dataset=True, base_folder_path=datapath)
@@ -509,6 +509,7 @@ evaluation_params = {
     'cutoff_early_layers': False,
     'nodes_to_always_ablate': ablate_error_hook,
     'always_ablate_positions': positions_to_select,
+    'return_all_metrics': True,
     # 'use_zero_ablation': True, # Uncomment if you want to run a zero ablation variant
     
     'batch_size': 1024,
@@ -632,7 +633,7 @@ for layer_idx, layer in enumerate(layers_to_extract):
 # Create DataFrame from the collected results
 results_df = pd.DataFrame(results)
 
-SAVING_NAME_SUFFIX = 'GC_last_token'
+SAVING_NAME_SUFFIX = 'GF_last_token'
 SAVING_NAME_SUFFIX = '_' + SAVING_NAME_SUFFIX if SAVING_NAME_SUFFIX else SAVING_NAME_SUFFIX
 
 SAVING_NAME_RESULTS = f'faithfulness_with_different_topk{SAVING_NAME_SUFFIX}.csv'
@@ -773,7 +774,7 @@ def plot_faithfulness_vs_layer_ranges(results_df, layers_to_extract, plot_stds=F
                 print(f"  Top {k} features: {mean_faith:.4f}")
 
 
-results_df = pd.read_csv(saving_dir / SAVING_NAME_RESULTS)
+results_df = pd.read_csv(saving_dir / "faithfulness_with_different_topk_GF_last_token.csv")
 
 plot_faithfulness_vs_layer_ranges(results_df, layers_to_extract, plot_stds=False)
 
@@ -795,11 +796,12 @@ top_k_value = 25  # Fixed value for top-k features
 evaluation_params = {
     'cutoff_early_layers': False,
     'always_ablate_positions': positions_to_select,
+    'return_all_metrics': True,
     # 'use_zero_ablation': True, # Uncomment if you want to run a zero ablation variant
     
     'batch_size': 1024,
     'total_batches': None,
-    'verbose': False
+    'verbose': True
 }
 
 # Initialize data collection structures
@@ -909,7 +911,7 @@ for layer_idx, layer in enumerate(layers_to_extract):
 # Create DataFrame from the collected results
 results_df = pd.DataFrame(results)
 
-SAVING_NAME_SUFFIX = 'GF'
+SAVING_NAME_SUFFIX = 'GF_last_token'
 SAVING_NAME_SUFFIX = '_' + SAVING_NAME_SUFFIX if SAVING_NAME_SUFFIX else SAVING_NAME_SUFFIX
 
 SAVING_NAME_RESULTS = f'faithfulness_with_error_thresholds{SAVING_NAME_SUFFIX}.csv'
@@ -1138,7 +1140,7 @@ import numpy as np
 import pandas as pd
 import plotly.io as pio
 
-SAVING_NAME_SUFFIX = f'{window_width}'
+SAVING_NAME_SUFFIX = f'GF_{window_width}'
 SAVING_NAME_SUFFIX = '_' + SAVING_NAME_SUFFIX if SAVING_NAME_SUFFIX else SAVING_NAME_SUFFIX
 
 # Create a DataFrame for easier plotting with Plotly
@@ -1541,7 +1543,7 @@ WINDOW_STEP = 1
 MAX_LAYER = error_layers_to_ablate[-1]
 
 # Define the number of top features to ablate in each window.
-TOP_K_TO_ABLATE = [] # 1, 5
+TOP_K_TO_ABLATE = [10] # 1, 5
 
 # Parameters for selecting which resid_post features to ablate
 FEATURE_EXTRACTION_PARAMS = {
@@ -1571,7 +1573,8 @@ EVALUATION_PARAMS_FEATURES
 # --- Main Sliding Window Feature Ablation Loop ---
 
 # This dictionary will store a results DataFrame for each top_k value
-feature_ablation_results_dict = {}
+if 'feature_ablation_results_dict' not in locals():
+    feature_ablation_results_dict = {}
 
 for top_k in TOP_K_TO_ABLATE:
     print(f"\n{'='*80}\nRUNNING FOR TOP_K = {top_k}\n{'='*80}")
@@ -1753,9 +1756,14 @@ if feature_ablation_results_dict:
 
 # #### Feature baselines implementation
 
-# This is the variant we used in the post, implementing different feature baselines or `SELECTION_MODES` as named below.
+# Reset the hooks to avoid weird bugs
+sfc_model.model.reset_hooks()
+if RUN_WITH_SAES:
+    sfc_model._reset_sae_hooks()
+clear_cache()
 
-# ablate_errors_but_restore_features_GF_dataset.py
+
+# This is the variant we used in the post, implementing different feature baselines or `SELECTION_MODES` as named below.
 
 # --- NEW Experiment: Feature Ablation via Layer-by-Layer Score Matching ---
 
@@ -1764,17 +1772,21 @@ from collections import defaultdict
 
 # --- Configuration ---
 # Define the three selection strategies we want to test
-SELECTION_MODES = ['top_1', 'min_abs_diff', 'constrained_min_diff']
+SELECTION_MODES = ['committee_matching'] # committee_matching 'top_1', 'min_abs_diff'
 
 WINDOW_WIDTH = 4
 WINDOW_STEP = 1
 MAX_LAYER = error_layers_to_ablate[-1]
 
+# Parameters for the faithfulness evaluation call
 EVALUATION_PARAMS_FEATURES = {
+    # the params below should generally be fixed as they are
     'cutoff_early_layers': False,
     'always_ablate_positions': positions_to_select,
-
     'return_all_metrics': True,
+
+    # these params are modifable 
+    # 'use_zero_ablation': True, # Uncomment if you want to run a zero ablation variant
     'batch_size': 1024,
     'total_batches': None,
     'verbose': True
@@ -1798,56 +1810,108 @@ for mode in SELECTION_MODES:
     while window_right <= MAX_LAYER:
         current_layer_range = list(range(window_left, window_right + 1))
         print(f"Processing window {current_layer_range}...")
-        
+
         feature_indices_to_ablate = defaultdict(list)
-        
+        committee_sizes_for_window = []
+
+        # Find the best feature(s) for each layer in the current window
         for layer_num in current_layer_range:
-            # --- Common Setup for each layer ---
             error_node_name = f"blocks.{layer_num}.hook_resid_post.hook_sae_error"
             feature_node_name = f"blocks.{layer_num}.hook_resid_post.hook_sae_acts_post"
-            
+
             if feature_node_name not in circuit_evaluator.sfc_node_scores.node_scores:
                 print(f"  Warning: No scores for {feature_node_name}. Skipping layer.")
                 continue
-                
+
             feature_scores_at_pos = circuit_evaluator.sfc_node_scores.node_scores[feature_node_name][positions_to_select, :].sum(dim=0)
-            
+            best_feature_indices_for_layer = []
+
             # --- Mode-Specific Feature Selection Logic ---
             if mode == 'top_1':
+                # Select the single feature with the highest score.
                 best_feature_idx = torch.argmax(feature_scores_at_pos).item()
-                
+                best_feature_indices_for_layer.append(best_feature_idx)
+
             elif mode == 'min_abs_diff':
+                # Select the single feature whose score is closest to the error node's score.
+                if error_node_name not in circuit_evaluator.sfc_node_scores.node_scores:
+                    continue
                 target_score = circuit_evaluator.sfc_node_scores.node_scores[error_node_name][positions_to_select].sum().item()
                 diffs = torch.abs(feature_scores_at_pos - target_score)
                 best_feature_idx = torch.argmin(diffs).item()
-                
-            elif mode == 'constrained_min_diff':
+                best_feature_indices_for_layer.append(best_feature_idx)
+
+            elif mode == 'committee_matching':
+                # Select one or more features to meet or exceed the error node's score.
+                if error_node_name not in circuit_evaluator.sfc_node_scores.node_scores:
+                    continue
                 target_score = circuit_evaluator.sfc_node_scores.node_scores[error_node_name][positions_to_select].sum().item()
                 candidate_indices = torch.where(feature_scores_at_pos >= target_score)[0]
+
                 if len(candidate_indices) > 0:
+                    # If any single features are strong enough, pick the one that's "just right".
                     candidate_scores = feature_scores_at_pos[candidate_indices]
                     best_feature_idx = candidate_indices[torch.argmin(candidate_scores)].item()
-                else: # Fallback
-                    best_feature_idx = torch.argmax(feature_scores_at_pos).item()
-            
-            feature_indices_to_ablate[feature_node_name].append(best_feature_idx)
-            
-        # ... (Evaluation and result storing logic is the same as before) ...
-        actual_sfc_score_sum = 0.0;
-        for node_name, indices in feature_indices_to_ablate.items():
-            scores_tensor = circuit_evaluator.sfc_node_scores.node_scores[node_name];
-            if len(indices) > 0:
-                 selected_scores = scores_tensor[positions_to_select, :][:, indices];
-                 actual_sfc_score_sum += selected_scores.sum().item()
-                
-        faithfulness_metrics, _ = circuit_evaluator.evaluate_circuit_faithfulness(clean_dataset=clean_dataset, patched_dataset=None, feature_indices_to_ablate=feature_indices_to_ablate, **EVALUATION_PARAMS_FEATURES);
-        faithfulness_finite_mask = torch.isfinite(faithfulness_metrics); mean_faithfulness = faithfulness_metrics[faithfulness_finite_mask].mean().item(); std_faithfulness = faithfulness_metrics[faithfulness_finite_mask].std().item();
-        mode_results['window_left'].append(window_left); mode_results['window_right'].append(window_right); mode_results['mean_faithfulness'].append(mean_faithfulness); mode_results['std_faithfulness'].append(std_faithfulness); mode_results['sfc_score_sum'].append(actual_sfc_score_sum);
+                    best_feature_indices_for_layer.append(best_feature_idx)
+                else:
+                    # Fallback: If no single feature is strong enough, form a "committee".
+                    print(f"  Info: No single feature >= {target_score:.3f} in layer {layer_num}. Forming committee.")
+                    sorted_scores, sorted_indices = torch.sort(feature_scores_at_pos, descending=True)
+                    cumulative_scores = torch.cumsum(sorted_scores, dim=0)
+                    committee_size_tensor = torch.where(cumulative_scores >= target_score)[0]
 
-        window_left += WINDOW_STEP; window_right += WINDOW_STEP
-        clear_cache()
+                    if len(committee_size_tensor) > 0:
+                        # Find the smallest committee whose sum exceeds the target.
+                        committee_size = committee_size_tensor[0].item() + 1
+                    else:
+                        # If all features combined aren't enough, take all of them.
+                        print(f"  Warning: All features in layer {layer_num} do not sum to target. Taking all.")
+                        committee_size = len(sorted_indices)
+                    
+                    best_feature_indices_for_layer.extend(sorted_indices[:committee_size].tolist())
+                # end elif block
+            # Store the selected features for this layer.
+            feature_indices_to_ablate[feature_node_name].extend(best_feature_indices_for_layer)
+            if mode == 'committee_matching':
+                committee_sizes_for_window.append(len(best_feature_indices_for_layer))
+            
+        # --- Evaluate Faithfulness and Store Results for the Window ---
+        # Calculate the actual sum of AtP scores for the selected features.
+        actual_sfc_score_sum = 0.0
+        for node_name, indices in feature_indices_to_ablate.items():
+            scores_tensor = circuit_evaluator.sfc_node_scores.node_scores[node_name]
+            if len(indices) > 0:
+                selected_scores = scores_tensor[positions_to_select, :][:, indices]
+                actual_sfc_score_sum += selected_scores.sum().item()
+
+        # Run the main evaluation.
+        faithfulness_metrics, _ = circuit_evaluator.evaluate_circuit_faithfulness(
+            clean_dataset=clean_dataset,
+            patched_dataset=None,
+            feature_indices_to_ablate=feature_indices_to_ablate,
+            **EVALUATION_PARAMS_FEATURES
+        )
+
+        # Process and store the metrics.
+        faithfulness_finite_mask = torch.isfinite(faithfulness_metrics)
+        mean_faithfulness = faithfulness_metrics[faithfulness_finite_mask].mean().item()
+        std_faithfulness = faithfulness_metrics[faithfulness_finite_mask].std().item()
+
+        mode_results['window_left'].append(window_left)
+        mode_results['window_right'].append(window_right)
+        mode_results['mean_faithfulness'].append(mean_faithfulness)
+        mode_results['std_faithfulness'].append(std_faithfulness)
+        mode_results['sfc_score_sum'].append(actual_sfc_score_sum)
         
-    # Store the final DataFrame for this mode
+        if mode == 'committee_matching':
+            mode_results['committee_sizes'].append(committee_sizes_for_window)
+
+        # Advance the sliding window.
+        window_left += WINDOW_STEP
+        window_right += WINDOW_STEP
+        clear_cache()
+        # end while
+    # Store the final DataFrame for this mode.
     all_feature_ablation_results[mode] = pd.DataFrame(mode_results)
     print(f"\n--- Feature Ablation Summary (Mode: {mode}) ---")
     print(all_feature_ablation_results[mode])
@@ -1880,7 +1944,7 @@ def plot_multi_heuristic_ablation_separate(feature_results_dict, error_results_d
     heuristic_names = {
         'top_1': 'Ablate Top-1 Feature',
         'min_abs_diff': 'Ablate Min Abs Diff Feature',
-        'constrained_min_diff': 'Ablate Constrained Min Diff Feature'
+        'committee_matching': 'Ablate "Committee" Feature(s)' # New name
     }
     
     last_df = None # To set the x-axis ticks later
@@ -1973,7 +2037,7 @@ plot_multi_heuristic_ablation_separate(all_feature_ablation_results, error_ablat
 # --- Configuration for Saving ---
 # Modify this suffix to version your output files. It will be appended to filenames.
 # For example, 'v2', 'with_zero_ablation', etc.
-SAVING_NAME_SUFFIX = 'GC_last_token' 
+SAVING_NAME_SUFFIX = 'GF_last_token_CM' 
 
 # --- Prepare Suffix String ---
 # Add a leading underscore to the suffix if it's not empty
@@ -2010,6 +2074,427 @@ if 'error_ablation_results_df' in locals() and isinstance(error_ablation_results
     print(f"Saved error node ablation results to: {save_path}")
 else:
     print("Variable 'error_ablation_results_df' not found or is empty. Nothing to save.")
+
+
+# ## (Combined) Sliding window ablation plotting
+
+# ablate_errors_but_restore_features_GF_dataset.py
+
+# --- Helper Function to Load Experiment Results ---
+import pandas as pd
+
+def load_experiment_results(saving_dir, suffix, feature_modes):
+    """
+    Loads all result DataFrames for a given experiment suffix.
+    
+    Args:
+        saving_dir: The Path object for the directory where results are saved.
+        suffix: The string suffix of the experiment to load (e.g., 'GF').
+        feature_modes: A list of the feature ablation modes that were run 
+                       (e.g., ['top_1', 'min_abs_diff']).
+                       
+    Returns:
+        A tuple containing:
+        - A dictionary of feature ablation DataFrames.
+        - The error node ablation DataFrame.
+    """
+    print(f"\n--- Loading results for suffix: '{suffix}' ---")
+    suffix_str = f"_{suffix}" if suffix else ""
+    
+    # Load feature ablation results
+    loaded_feature_results = {}
+    for mode in feature_modes:
+        filename = f"sliding_window_features_mode_{mode}{suffix_str}.csv"
+        try:
+            df = pd.read_csv(saving_dir / filename)
+            loaded_feature_results[mode] = df
+            print(f"  Successfully loaded: {filename}")
+        except FileNotFoundError:
+            print(f"  Warning: File not found, skipping: {filename}")
+            
+    # Load error node ablation results
+    loaded_error_results_df = None
+    filename = f"sliding_window_errors{suffix_str}.csv"
+    try:
+        loaded_error_results_df = pd.read_csv(saving_dir / filename)
+        print(f"  Successfully loaded: {filename}")
+    except FileNotFoundError:
+        print(f"  Warning: File not found, skipping: {filename}")
+        
+    return loaded_feature_results, loaded_error_results_df
+
+
+# ### Plot all the sliding window data
+
+# --- Cell 1: Load and Consolidate All Experiment Data ---
+
+# --- Configuration for Loading ---
+# This should match the suffix you used when saving your multi-mode results
+EXPERIMENT_SUFFIX = 'GF_last_token' 
+MODES_TO_LOAD = ['top_1', 'min_abs_diff', 'committee_matching'] 
+
+# --- Load Data from Files ---
+loaded_feature_results, loaded_error_results_df = load_experiment_results(
+    saving_dir, EXPERIMENT_SUFFIX, MODES_TO_LOAD
+)
+
+# --- Create a Master Dictionary for Plotting ---
+all_plot_data = {}
+
+# 1. Add the error node baseline data
+if loaded_error_results_df is not None:
+    all_plot_data['error_nodes'] = loaded_error_results_df
+elif 'error_ablation_results_df' in locals() and error_ablation_results_df is not None:
+    all_plot_data['error_nodes'] = error_ablation_results_df
+
+# 2. Add the "heuristic" modes, renaming 'top_1' to 'fixed_top_1'
+# Start with loaded results...
+for mode, df in loaded_feature_results.items():
+    if mode == 'top_1':
+        all_plot_data['fixed_top_1'] = df # Unify the key
+    else:
+        all_plot_data[mode] = df
+        
+# ...then overwrite with any in-memory results
+if 'all_feature_ablation_results' in locals():
+    for mode, df in all_feature_ablation_results.items():
+        if mode == 'top_1':
+            all_plot_data['fixed_top_1'] = df # Unify the key
+        else:
+            all_plot_data[mode] = df
+
+# 3. Add the results from the "fixed top-K" experiments
+if 'feature_ablation_results_dict' in locals():
+    for top_k, df in feature_ablation_results_dict.items():
+        all_plot_data[f'fixed_top_{top_k}'] = df
+
+print("\n--- Consolidated Data for Plotting (with Unified Keys) ---")
+print(f"Plotting the following {len(all_plot_data)} data series: {list(all_plot_data.keys())}")
+
+
+def plot_all_experiments_separate(all_results_dict, save_prefix="ablation_plot", save=True, ignore_modes=None):
+    """
+    Plots a comprehensive comparison of all ablation experiments, creating two separate plots:
+    1. Mean Faithfulness vs. Ablation Window.
+    2. Sum of Ablated AtP Scores vs. Ablation Window.
+
+    Args:
+        all_results_dict: Dict[str, pd.DataFrame]
+            Keys are ablation modes, values are DataFrames with results.
+        save_prefix: str
+            Base filename for saved images (no extension).
+        save: bool
+            Whether to save the resulting plots to disk.
+        ignore_modes: List[str]
+            List of mode keys to skip when plotting.
+    """
+    if ignore_modes is None:
+        ignore_modes = []
+
+    fig_faith = go.Figure()
+    fig_atp = go.Figure()
+    
+    colors = px.colors.qualitative.Plotly
+    color_idx = 0
+    last_df = None
+
+    for mode, df in all_results_dict.items():
+        if df.empty or mode in ignore_modes:
+            continue
+        last_df = df
+
+        # --- Determine plot label and style ---
+        is_fixed_k = isinstance(mode, str) and mode.startswith('fixed_top_')
+        is_heuristic = mode in ['min_abs_diff', 'committee_matching']
+        is_error = mode == 'error_nodes'
+
+        if is_fixed_k:
+            k_val = mode.split('_')[-1]
+            plot_name = f'Ablate Fixed Top {k_val} Feature(s)'
+            style = {'color': colors[color_idx % len(colors)], 'dash': 'solid'}
+            color_idx += 1
+        elif is_heuristic:
+            heuristic_names = {
+                'min_abs_diff': 'Ablate Min Abs Diff Feature',
+                'committee_matching': 'Ablate "Committee" Feature(s)'
+            }
+            plot_name = heuristic_names.get(mode, mode)
+            style = {'color': colors[color_idx % len(colors)], 'dash': 'dot'}
+            color_idx += 1
+        elif is_error:
+            plot_name = 'Ablate Error Nodes (Baseline)'
+            style = {'color': 'black', 'dash': 'dash'}
+        else:
+            plot_name = mode
+            style = {'color': colors[color_idx % len(colors)], 'dash': 'solid'}
+            color_idx += 1
+
+        df['Window Label'] = df.apply(lambda r: f"{int(r['window_left'])}-{int(r['window_right'])}", axis=1)
+        df['Window Midpoint'] = (df['window_left'] + df['window_right']) / 2
+
+        # --- Add Faithfulness trace ---
+        hover_faith = [
+            f"Faithfulness: {m:.3f}" + (f" ± {s:.3f}" if not pd.isna(s) else "")
+            for m, s in zip(df['mean_faithfulness'], df.get('std_faithfulness', np.nan))
+        ]
+        fig_faith.add_trace(go.Scatter(
+            x=df['Window Midpoint'], y=df['mean_faithfulness'],
+            mode='lines+markers',
+            name=plot_name,
+            legendgroup=mode,
+            line=dict(color=style['color'], dash=style['dash']),
+            marker=dict(symbol='circle' if not is_error else 'x-thin', size=8, color=style['color']),
+            hovertext=hover_faith,
+            hoverinfo='text+name'
+        ))
+
+        # --- Add AtP Score trace ---
+        fig_atp.add_trace(go.Scatter(
+            x=df['Window Midpoint'], y=df['sfc_score_sum'],
+            mode='lines+markers',
+            name=plot_name,
+            legendgroup=mode,
+            line=dict(color=style['color'], dash=style['dash']),
+            marker=dict(symbol='circle' if not is_error else 'x-thin', size=8, color=style['color']),
+            hovertext=[f"AtP Score Sum: {s:.2f}" for s in df['sfc_score_sum']],
+            hoverinfo='text+name'
+        ))
+
+    # --- Axis label formatting ---
+    if last_df is not None and not last_df.empty:
+        x_tickvals = last_df['Window Midpoint']
+        x_ticktext = last_df['Window Label']
+    else:
+        x_tickvals = []
+        x_ticktext = []
+
+    for fig in [fig_faith, fig_atp]:
+        fig.update_layout(
+            hovermode='x unified',
+            template='plotly_white',
+            legend_title_text='Ablation Strategy',
+            xaxis=dict(
+                title='Ablation Layer Window',
+                tickmode='array',
+                tickvals=x_tickvals,
+                ticktext=x_ticktext,
+                tickangle=45
+            )
+        )
+
+    fig_faith.update_layout(
+        title='Faithfulness across Feature Ablation windows',
+        yaxis=dict(title="<b>Mean Faithfulness</b>", range=[-0.1, 1.05], dtick=0.1)
+    )
+    fig_atp.update_layout(
+        title='Sum of AtP scores of the ablated features across Ablation windows',
+        yaxis_title="<b>Sum of AtP Scores</b>"
+    )
+
+    print("\n--- Faithfulness Plot ---")
+    fig_faith.show()
+    print("\n--- Ablated AtP Score Sum Plot ---")
+    fig_atp.show()
+
+    if save:
+        pio.write_image(fig_faith, f"{save_prefix}_faithfulness.png", format='png', scale=5, width=1000, height=500)
+        pio.write_image(fig_atp, f"{save_prefix}_atp_score_sum.png", format='png', scale=5, width=1000, height=500)
+
+
+plot_all_experiments_separate(
+    all_plot_data,
+    ignore_modes=['min_abs_diff', 'fixed_top_5'],
+    save_prefix="GF"
+)
+
+
+import pickle
+
+def save_all_plot_data(all_plot_data, saving_dir, suffix):
+    """
+    Saves all_plot_data dictionary to a pickle file.
+    
+    Args:
+        all_plot_data: dict[str, pd.DataFrame]
+        saving_dir: Path object
+        suffix: str (e.g. 'GF_last_token')
+    """
+    save_path = saving_dir / f"all_plot_data_{suffix}.pkl"
+    with open(save_path, 'wb') as f:
+        pickle.dump(all_plot_data, f)
+    print(f"✅ Saved all_plot_data to {save_path}")
+
+def load_all_plot_data(saving_dir, suffix):
+    """
+    Loads all_plot_data dictionary from a pickle file.
+    
+    Args:
+        saving_dir: Path object
+        suffix: str (e.g. 'GF_last_token')
+        
+    Returns:
+        dict[str, pd.DataFrame]
+    """
+    load_path = saving_dir / f"all_plot_data_{suffix}.pkl"
+    with open(load_path, 'rb') as f:
+        data = pickle.load(f)
+    print(f"✅ Loaded all_plot_data from {load_path}")
+    return data
+
+SAVING_SUFFIX = 'GF'
+save_all_plot_data(all_plot_data, saving_dir, SAVING_SUFFIX)
+
+
+# ### Plot the difference between sliding window ablation data
+
+def compute_plot_deltas(all_data_1, all_data_2):
+    """
+    Computes Δ mean_faithfulness between two all_plot_data dicts.
+    
+    Returns:
+        diff_dict: dict[str, pd.DataFrame]
+    """
+    diff_dict = {}
+    for key in all_data_1:
+        if key not in all_data_2:
+            print(f"⚠️ Key {key} not found in second dataset")
+            continue
+        df1, df2 = all_data_1[key].copy(), all_data_2[key].copy()
+        if len(df1) != len(df2):
+            print(f"⚠️ Length mismatch for mode {key}")
+            continue
+        diff_df = df1.copy()
+        diff_df['mean_faithfulness'] = df1['mean_faithfulness'] - df2['mean_faithfulness']
+        diff_df['Window Midpoint'] = (df1['window_left'] + df1['window_right']) / 2
+        diff_df['Window Label'] = df1.apply(lambda r: f"{int(r['window_left'])}-{int(r['window_right'])}", axis=1)
+        diff_dict[key] = diff_df
+    return diff_dict
+
+
+import plotly.graph_objects as go
+import plotly.express as px
+import plotly.io as pio
+
+def plot_faithfulness_deltas(
+    diff_dict,
+    save_prefix="delta_faithfulness_plot",
+    save=True,
+    ignore_modes=None,
+    title="Δ Faithfulness: Mean - Zero Ablation"
+):
+    """
+    Plots the difference in mean faithfulness across ablation windows between
+    two restoration conditions (e.g. mean vs zero).
+
+    Args:
+        diff_dict: Dict[str, pd.DataFrame]
+            Dictionary mapping ablation mode → delta DataFrame.
+        save_prefix: str
+            Filename prefix to use when saving.
+        save: bool
+            Whether to save the figure as PNG.
+        ignore_modes: list[str]
+            List of ablation modes to skip from plotting.
+        title: str
+            Title of the plot.
+    """
+    if ignore_modes is None:
+        ignore_modes = []
+
+    fig = go.Figure()
+    colors = px.colors.qualitative.Plotly
+    color_idx = 0
+    last_df = None
+
+    for mode, df in diff_dict.items():
+        if mode in ignore_modes or df.empty:
+            continue
+        last_df = df
+
+        # --- Label & Style ---
+        is_fixed_k = mode.startswith('fixed_top_')
+        is_heuristic = mode in ['min_abs_diff', 'committee_matching']
+        is_error = mode == 'error_nodes'
+
+        if is_fixed_k:
+            k_val = mode.split('_')[-1]
+            plot_name = f'Delta: Fixed Top {k_val}'
+            style = {'color': colors[color_idx % len(colors)], 'dash': 'solid'}
+            color_idx += 1
+        elif is_heuristic:
+            label_map = {
+                'min_abs_diff': 'Delta: Min Abs Diff',
+                'committee_matching': 'Delta: Committee'
+            }
+            plot_name = label_map.get(mode, mode)
+            style = {'color': colors[color_idx % len(colors)], 'dash': 'dot'}
+            color_idx += 1
+        elif is_error:
+            plot_name = 'Delta: Error Nodes (Baseline)'
+            style = {'color': 'black', 'dash': 'dash'}
+        else:
+            plot_name = f'Delta: {mode}'
+            style = {'color': colors[color_idx % len(colors)], 'dash': 'solid'}
+            color_idx += 1
+
+        # --- Plot Trace ---
+        fig.add_trace(go.Scatter(
+            x=df['Window Midpoint'],
+            y=df['mean_faithfulness'],
+            mode='lines+markers',
+            name=plot_name,
+            legendgroup=mode,
+            line=dict(color=style['color'], dash=style['dash']),
+            marker=dict(symbol='circle' if not is_error else 'x-thin', size=8, color=style['color']),
+            hovertext=[f"{plot_name}: Δ={v:.3f}" for v in df['mean_faithfulness']],
+            hoverinfo='text+name'
+        ))
+
+    # --- Format axes based on last plotted df ---
+    if last_df is not None and not last_df.empty:
+        x_tickvals = last_df['Window Midpoint']
+        x_ticktext = last_df['Window Label']
+    else:
+        x_tickvals = []
+        x_ticktext = []
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(
+            title='Ablation Layer Window',
+            tickmode='array',
+            tickvals=x_tickvals,
+            ticktext=x_ticktext,
+            tickangle=45
+        ),
+        yaxis=dict(
+            title="Δ Mean Faithfulness",
+            zeroline=True,
+            zerolinecolor='gray'
+        ),
+        template="plotly_white",
+        width=1000,
+        height=500,
+        legend_title="Ablation Strategy",
+        hovermode="x unified"
+    )
+
+    fig.show()
+
+    if save:
+        pio.write_image(fig, f"{save_prefix}_faithfulness_dif.png", format='png', scale=5, width=1000, height=500)
+
+
+# MODES = ['fixed_top_1', 'fixed_top_5', 'committee_matching']
+
+# === Load both versions ===
+data_mean = load_all_plot_data(saving_dir, "GF")
+data_zero = load_all_plot_data(saving_dir, "GF_zerp")
+
+# Compute deltas and plot
+delta_dict = compute_plot_deltas(data_mean, data_zero)
+plot_faithfulness_deltas(delta_dict, 
+                         ignore_modes=['fixed_top_5', 'min_abs_diff'])
 
 
 
