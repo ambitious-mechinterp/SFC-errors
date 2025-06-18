@@ -411,8 +411,8 @@ class SFC_Gemma():
         
         return aggregated_data
 
-    def run_with_cache(self, tokens,
-                       attn_mask, metric,
+    def run_with_cache(self, tokens: Int[Tensor, "batch pos"],
+                       attn_mask: Int[Tensor, "batch pos"], metric,
                        fwd_cache_filter=None, bwd_cache_filter=None, bwd_activations_to_cache=['sae_error'], 
                        run_backward_pass=True, run_without_saes=False):
         """
@@ -657,8 +657,8 @@ class SFC_Gemma():
                 score_update = score_update.mean(0)
                 node_scores[key] += score_update / total_batches
 
-    def get_answer_logit(self, logits, clean_answers,
-                         ansnwer_pos, return_all_logits=False):
+    def get_answer_logit(self, logits: Float[Tensor, "batch pos d_vocab"], clean_answers: Int[Tensor, "batch"],
+                         ansnwer_pos: Int[Tensor, "batch"], return_all_logits=False) -> Float[Tensor, "batch"]:
         # clean_answers_pos_idx = clean_answers_pos.unsqueeze(-1).unsqueeze(-1).expand(-1, logits.size(1), logits.size(2))
 
         answer_pos_idx = einops.repeat(ansnwer_pos, 'batch -> batch 1 d_vocab',
@@ -672,9 +672,9 @@ class SFC_Gemma():
 
         return correct_logits
 
-    def get_logit_diff(self, logits,
-                    clean_answers, patched_answers,
-                    answer_pos, patch_answer_reduce='max'):
+    def get_logit_diff(self, logits: Float[Tensor, "batch pos d_vocab"],
+                    clean_answers: Int[Tensor, "batch"], patched_answers: Int[Tensor, "batch count"],
+                    answer_pos: Int[Tensor, "batch"], patch_answer_reduce='max') -> Float[Tensor, "batch"]:
         """
         Computes the standard SFC metric: logit difference between the incorrect answers and the correct answer.
         The method extracts the log probabilities for the correct answer and the incorrect answers from the `logits` tensor,
