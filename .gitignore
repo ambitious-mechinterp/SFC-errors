@@ -1,7 +1,13 @@
 # Data
-/data/
-sfc-errors/data
+/data/*
 
+# But allow SFC datasets (they are very light anyway)
+!/data/rc_train_filtered.json
+!/data/rc_test.json
+!/data/rc_train_processed.csv
+!/data/rc_test_processed.csv
+!/data/rc_test_confident_model.json
+!/data/rc_test_confident_model_salient_circuit.json
 # Mac OS-specific storage files
 .DS_Store
 
